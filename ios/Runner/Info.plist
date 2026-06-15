@@ -45,5 +45,13 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>此应用需要访问您的相册以发送图片</string>
+	<key>NSCameraUsageDescription</key>
+	<string>此应用需要访问您的相机以拍照发送</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>此应用需要访问本地网络以发现和传输文件到局域网设备</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>此应用需要保存接收的文件到您的相册</string>
 </dict>
 </plist>

@@ -31,10 +31,13 @@ dependencies:
   flutter:
     sdk: flutter
 
+  file_picker: ^8.0.0
   multicast_dns: ^0.3.2+4
   cupertino_icons: ^1.0.8
   network_info_plus: ^6.0.0 # 用于获取当前手机的局域网 IP
   device_info_plus: ^11.0.0
+  path_provider: ^2.1.0 # 用于获取应用文档目录（消息缓存）
+  image_picker: ^1.0.0 # 用于拍照和选择图片
 dev_dependencies:
   flutter_test:
     sdk: flutter

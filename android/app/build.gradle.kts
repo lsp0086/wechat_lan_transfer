@@ -31,7 +31,7 @@ android {
     }
 
     signingConfigs {
-        create("debug") {
+        getByName("debug") {
             storeFile = file("keystore/my_debug.kts")
             storePassword = "trans123"
             keyAlias = "my_debug"

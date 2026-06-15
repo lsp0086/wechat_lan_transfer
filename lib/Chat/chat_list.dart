@@ -405,8 +405,9 @@ class ChatListPageState extends State<ChatListPage> {
               itemBuilder: (context, index) {
                 final device = _realLanDevices[index];
                 IconData deviceIcon = Icons.devices;
-                if (device['type'] == 'mobile')
+                if (device['type'] == 'mobile') {
                   deviceIcon = Icons.phone_android;
+                }
                 if (device['type'] == 'desktop') deviceIcon = Icons.computer;
 
                 return InkWell(

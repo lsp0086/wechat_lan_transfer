@@ -5,7 +5,7 @@ class ChatInfoPage extends StatefulWidget {
   final String id; // 局域网目标 IP
   final String name; // 目标设备昵称
 
-  ChatInfoPage({required this.id, required this.name});
+  const ChatInfoPage({super.key, required this.id, required this.name});
 
   @override
   _ChatInfoPageState createState() => _ChatInfoPageState();
