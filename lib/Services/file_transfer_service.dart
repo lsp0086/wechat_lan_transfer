@@ -45,6 +45,18 @@ class FileTransferTask {
   });
 }
 
+/// 接收初始化结果
+class _ReceiveInitResult {
+  final FileTransferTask task;
+  final String savePath;
+  final IOSink sink;
+  _ReceiveInitResult({
+    required this.task,
+    required this.savePath,
+    required this.sink,
+  });
+}
+
 /// 文件传输服务：基于 TCP 的文件发送/接收引擎
 class FileTransferService {
   static const int defaultPort = 8899;
@@ -144,19 +156,20 @@ class FileTransferService {
       task.status = TransferStatus.transferring;
       _progressController.add(task);
 
-      // 发送文件头信息（JSON + 填充到 headerSize）
+      // 发送文件头信息（固定1024字节JSON头 + 4字节头长度）
       final header = jsonEncode({
         'fileName': fileName,
         'fileSize': fileSize,
         'taskId': taskId,
       });
       final headerBytes = utf8.encode(header);
-      final paddedHeader = Uint8List(headerSize);
-      paddedHeader.fillRange(0, headerBytes.length > headerSize ? headerSize : headerBytes.length, 0);
-      for (int i = 0; i < headerBytes.length && i < headerSize; i++) {
-        paddedHeader[i] = headerBytes[i];
+      if (headerBytes.length > headerSize) {
+        throw Exception('文件名过长，超出头部限制');
       }
-      // 在末尾写入实际头长度
+      // 构造固定长度头部：JSON数据 + 零填充
+      final paddedHeader = Uint8List(headerSize);
+      paddedHeader.setRange(0, headerBytes.length, headerBytes);
+      // 构造4字节的头长度标记（大端序）
       final headerLenBytes = ByteData(4)..setInt32(0, headerBytes.length, Endian.big);
       socket.add(paddedHeader);
       socket.add(headerLenBytes.buffer.asUint8List());
@@ -190,32 +203,164 @@ class FileTransferService {
     }
   }
 
-  /// 处理接收连接
+  /// 处理接收连接（使用 Completer + listen 方式一次性处理头部和文件内容）
   Future<void> _handleIncomingConnection(Socket client) async {
+    final completer = Completer<void>();
     FileTransferTask? task;
-    String filePath = '';
+    String? savePath;
+    IOSink? sink;
+
+    // 状态机: 0=等待头部, 1=接收文件内容
+    int state = 0;
+    final headerBuffer = <int>[];
+    int bytesReceived = 0;
+    int expectedFileSize = 0;
+
+    final subscription = client.listen(
+      (chunk) {
+        try {
+          if (state == 0) {
+            // 阶段1: 收集头部数据
+            headerBuffer.addAll(chunk);
+            if (headerBuffer.length >= headerSize + 4) {
+              // 头部收集完毕，解析
+              final headerBytes = Uint8List.fromList(headerBuffer);
+              final headerLenData = ByteData.sublistView(
+                headerBytes, headerSize, headerSize + 4);
+              final headerLen = headerLenData.getInt32(0, Endian.big);
+
+              if (headerLen <= 0 || headerLen > headerSize) {
+                debugPrint('文件接收失败: 非法头部长度 $headerLen');
+                completer.completeError(
+                  Exception('非法头部长度 $headerLen'));
+                return;
+              }
+
+              final headerJson = utf8.decode(
+                headerBytes.sublist(0, headerLen));
+              final header =
+                  jsonDecode(headerJson) as Map<String, dynamic>;
+              final fileName = header['fileName'] as String;
+              final fileSize = header['fileSize'] as int;
+              final taskId = header['taskId'] as String;
+
+              // 异步初始化保存路径和文件写入器
+              _initReceiveTask(
+                fileName: fileName,
+                fileSize: fileSize,
+                taskId: taskId,
+                senderIp: client.address.address,
+              ).then((initResult) {
+                if (initResult == null) {
+                  completer.completeError(
+                    Exception('初始化接收任务失败'));
+                  return;
+                }
+                task = initResult.task;
+                savePath = initResult.savePath;
+                sink = initResult.sink;
+                expectedFileSize = fileSize;
+
+                // 处理头部之后可能已接收的多余数据（属于文件内容）
+                final extraData = headerBuffer.length > headerSize + 4
+                    ? headerBuffer.sublist(headerSize + 4)
+                    : null;
+                if (extraData != null && extraData.isNotEmpty) {
+                  sink!.add(extraData);
+                  bytesReceived = extraData.length;
+                  if (task != null) {
+                    task!.progress = bytesReceived / fileSize;
+                    _progressController.add(task!);
+                  }
+                }
+
+                state = 1;
+              }).catchError((e) {
+                completer.completeError(e);
+              });
+            }
+          } else if (state == 1) {
+            // 阶段2: 接收文件内容
+            if (sink != null && task != null) {
+              sink!.add(chunk);
+              bytesReceived += chunk.length;
+              task!.progress = bytesReceived / expectedFileSize;
+              _progressController.add(task!);
+            }
+          }
+        } catch (e) {
+          debugPrint('接收数据处理异常: $e');
+          if (!completer.isCompleted) {
+            completer.completeError(e);
+          }
+        }
+      },
+      onError: (error) {
+        debugPrint('Socket 接收错误: $error');
+        if (!completer.isCompleted) {
+          completer.completeError(error);
+        }
+      },
+      onDone: () async {
+        // 连接关闭，完成接收
+        try {
+          if (sink != null) {
+            await sink!.close();
+          }
+        } catch (_) {}
+
+        if (task != null && savePath != null) {
+          if (bytesReceived >= expectedFileSize) {
+            task!.status = TransferStatus.completed;
+            task!.progress = 1.0;
+            task!.savedPath = savePath;
+            _progressController.add(task!);
+            debugPrint(
+              '文件接收完成: ${task!.fileName} -> $savePath '
+              '(${_formatFileSize(expectedFileSize)})');
+          } else {
+            task!.status = TransferStatus.failed;
+            task!.errorMessage =
+              '传输中断 (接收 $bytesReceived/$expectedFileSize 字节)';
+            _progressController.add(task!);
+            debugPrint('文件接收不完整: ${task!.fileName}');
+          }
+        }
+
+        if (!completer.isCompleted) {
+          completer.complete();
+        }
+      },
+      cancelOnError: false,
+    );
 
     try {
-      // 读取文件头
-      final headerBuffer = await _readExactly(client, headerSize + 4);
+      await completer.future;
+    } catch (e) {
+      debugPrint('文件接收失败: $e');
+      if (task != null) {
+        task!.status = TransferStatus.failed;
+        task!.errorMessage = e.toString();
+        _progressController.add(task!);
+      }
+    } finally {
+      try {
+        await sink?.close();
+      } catch (_) {}
+      try {
+        await client.close();
+      } catch (_) {}
+    }
+  }
 
-      // 解析头长度
-      final headerLenData = headerBuffer.buffer.asByteData(
-        headerSize,
-        4,
-      );
-      final headerLen = headerLenData.getInt32(0, Endian.big);
-
-      // 解析 JSON 头
-      final headerJson = utf8.decode(
-        headerBuffer.sublist(0, headerLen > headerSize ? headerSize : headerLen),
-      );
-      final header = jsonDecode(headerJson) as Map<String, dynamic>;
-      final fileName = header['fileName'] as String;
-      final fileSize = header['fileSize'] as int;
-      final taskId = header['taskId'] as String;
-
-      // 创建保存路径
+  /// 初始化接收任务的保存路径和文件写入器
+  Future<_ReceiveInitResult?> _initReceiveTask({
+    required String fileName,
+    required int fileSize,
+    required String taskId,
+    required String senderIp,
+  }) async {
+    try {
       final saveDir = _saveDirectory ?? await _getDefaultSaveDir();
       final dir = Directory(saveDir);
       if (!await dir.exists()) {
@@ -238,12 +383,12 @@ class FileTransferService {
         counter++;
       }
 
-      task = FileTransferTask(
+      final task = FileTransferTask(
         id: taskId,
         fileName: fileName,
         filePath: savePath,
         fileSize: fileSize,
-        targetIp: client.address.address,
+        targetIp: senderIp,
         port: defaultPort,
         isSender: false,
         status: TransferStatus.transferring,
@@ -253,62 +398,29 @@ class FileTransferService {
       _newTaskController.add(task);
       _progressController.add(task);
 
-      // 接收文件内容
       final saveFile = File(savePath);
       final sink = saveFile.openWrite();
-      int bytesReceived = 0;
 
-      try {
-        await for (final chunk in client) {
-          sink.add(chunk);
-          bytesReceived += chunk.length;
-          task.progress = bytesReceived / fileSize;
-          _progressController.add(task);
-        }
-      } finally {
-        await sink.close();
-      }
+      debugPrint('开始接收文件: $fileName (${_formatFileSize(fileSize)})');
 
-      task.status = TransferStatus.completed;
-      task.progress = 1.0;
-      task.savedPath = savePath;
-      _progressController.add(task);
-
-      debugPrint('文件接收完成: $fileName -> $savePath');
+      return _ReceiveInitResult(
+        task: task,
+        savePath: savePath,
+        sink: sink,
+      );
     } catch (e) {
-      debugPrint('文件接收失败: $e');
-      if (task != null) {
-        task.status = TransferStatus.failed;
-        task.errorMessage = e.toString();
-        _progressController.add(task);
-      }
-      // 清理未完成的文件（task 为 null 说明头解析失败，文件可能已部分写入）
-      if (task == null && filePath.isNotEmpty) {
-        try {
-          await File(filePath).delete();
-        } catch (_) {}
-      }
-    } finally {
-      try {
-        await client.close();
-      } catch (_) {}
+      debugPrint('初始化接收任务失败: $e');
+      return null;
     }
   }
 
-  /// 精确读取指定字节数
-  Future<Uint8List> _readExactly(Socket socket, int byteCount) async {
-    final buffer = Uint8List(byteCount);
-    int offset = 0;
-    while (offset < byteCount) {
-      final chunk = await socket.first;
-      final toCopy = (chunk.length <= byteCount - offset)
-          ? chunk.length
-          : byteCount - offset;
-      buffer.setRange(offset, offset + toCopy, chunk);
-      offset += toCopy;
-      if (offset >= byteCount) break;
+  String _formatFileSize(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB';
     }
-    return buffer;
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
   /// 取消传输
