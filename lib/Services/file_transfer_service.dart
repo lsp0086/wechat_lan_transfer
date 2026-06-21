@@ -210,19 +210,24 @@ class FileTransferService {
     String? savePath;
     IOSink? sink;
 
-    // 状态机: 0=等待头部, 1=接收文件内容
+    // 状态机: 0=等待头部, 1=接收文件内容, 2=正在初始化接收任务
     int state = 0;
     final headerBuffer = <int>[];
+    // 在 state=2 期间缓冲到达的文件数据块，初始化完成后一次性写入
+    final List<List<int>> pendingChunks = [];
     int bytesReceived = 0;
     int expectedFileSize = 0;
 
-    final subscription = client.listen(
+    client.listen(
       (chunk) {
         try {
           if (state == 0) {
             // 阶段1: 收集头部数据
             headerBuffer.addAll(chunk);
             if (headerBuffer.length >= headerSize + 4) {
+              // 立即切换到过渡状态，防止异步初始化期间重复解析头部
+              state = 2; // 2 = 正在初始化接收任务
+
               // 头部收集完毕，解析
               final headerBytes = Uint8List.fromList(headerBuffer);
               final headerLenData = ByteData.sublistView(
@@ -268,10 +273,18 @@ class FileTransferService {
                 if (extraData != null && extraData.isNotEmpty) {
                   sink!.add(extraData);
                   bytesReceived = extraData.length;
-                  if (task != null) {
-                    task!.progress = bytesReceived / fileSize;
-                    _progressController.add(task!);
-                  }
+                }
+
+                // 写入在 state=2 期间缓冲的数据块
+                for (final bufferedChunk in pendingChunks) {
+                  sink!.add(bufferedChunk);
+                  bytesReceived += bufferedChunk.length;
+                }
+                pendingChunks.clear();
+
+                if (task != null && bytesReceived > 0) {
+                  task!.progress = bytesReceived / fileSize;
+                  _progressController.add(task!);
                 }
 
                 state = 1;
@@ -287,6 +300,9 @@ class FileTransferService {
               task!.progress = bytesReceived / expectedFileSize;
               _progressController.add(task!);
             }
+          } else {
+            // state == 2: 正在异步初始化，缓冲到达的数据块
+            pendingChunks.add(chunk.toList());
           }
         } catch (e) {
           debugPrint('接收数据处理异常: $e');
@@ -464,23 +480,36 @@ class FileTransferService {
       return '${docDir.path}/WeChatLanTransfer';
     } else if (Platform.isWindows) {
       // Windows: 使用 Downloads 目录
-      final downloadsPath = await getDownloadsDirectory();
-      if (downloadsPath != null) {
+      String? downloadsPath;
+      try {
+        final dir = await getDownloadsDirectory();
+        downloadsPath = dir?.path;
+      } catch (_) {}
+      if (downloadsPath != null && downloadsPath.isNotEmpty) {
         return '$downloadsPath\\WeChatLanTransfer';
       }
-      // 回退
-      return '${Platform.environment['USERPROFILE'] ?? '.'}\\Downloads\\WeChatLanTransfer';
+      // 回退：使用 USERPROFILE 环境变量
+      final userProfile = Platform.environment['USERPROFILE'] ?? '.';
+      return '$userProfile\\Downloads\\WeChatLanTransfer';
     } else if (Platform.isMacOS) {
       // macOS: 使用 Downloads 目录
-      final downloadsPath = await getDownloadsDirectory();
-      if (downloadsPath != null) {
+      String? downloadsPath;
+      try {
+        final dir = await getDownloadsDirectory();
+        downloadsPath = dir?.path;
+      } catch (_) {}
+      if (downloadsPath != null && downloadsPath.isNotEmpty) {
         return '$downloadsPath/WeChatLanTransfer';
       }
       return '${Platform.environment['HOME'] ?? '.'}/Downloads/WeChatLanTransfer';
     } else if (Platform.isLinux) {
       // Linux: 使用 Downloads 目录
-      final downloadsPath = await getDownloadsDirectory();
-      if (downloadsPath != null) {
+      String? downloadsPath;
+      try {
+        final dir = await getDownloadsDirectory();
+        downloadsPath = dir?.path;
+      } catch (_) {}
+      if (downloadsPath != null && downloadsPath.isNotEmpty) {
         return '$downloadsPath/WeChatLanTransfer';
       }
       return '${Platform.environment['HOME'] ?? '.'}/Downloads/WeChatLanTransfer';

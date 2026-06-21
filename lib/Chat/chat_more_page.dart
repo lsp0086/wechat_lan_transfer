@@ -2,14 +2,12 @@ import 'package:flutter/material.dart';
 
 class ChatMorePage extends StatelessWidget {
   final String id;
-  final double keyboardHeight;
   final VoidCallback onFileSelected; // 文件选择
   final VoidCallback? onPickImage; // 相册选择图片
   final VoidCallback? onTakePhoto; // 拍照
 
-  ChatMorePage({
+  const ChatMorePage({super.key, 
     required this.id,
-    required this.keyboardHeight,
     required this.onFileSelected,
     this.onPickImage,
     this.onTakePhoto,

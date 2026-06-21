@@ -4,12 +4,51 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:network_info_plus/network_info_plus.dart';
-import 'package:device_info_plus/device_info_plus.dart'; // 💡 引入真实设备信息库
+import 'package:device_info_plus/device_info_plus.dart';
 import 'chat_page.dart';
+import '../Services/udp_message_service.dart';
+import '../Services/message_cache_service.dart';
 
 // 利用 Extension 扩展 Platform，优雅地补充 isMobile 属性
 extension PlatformMobileExtension on Platform {
   static bool get isMobile => Platform.isAndroid || Platform.isIOS;
+}
+
+/// 设备数据模型
+class _DeviceInfo {
+  final String id;
+  String name;
+  String type;
+  String lastMsg;
+  DeviceOnlineStatus onlineStatus;
+  DateTime lastSeen;
+
+  _DeviceInfo({
+    required this.id,
+    required this.name,
+    required this.type,
+    required this.lastMsg,
+    this.onlineStatus = DeviceOnlineStatus.unknown,
+    DateTime? lastSeen,
+  }) : lastSeen = lastSeen ?? DateTime.now();
+
+  Map<String, String> toJson() => {
+        'id': id,
+        'name': name,
+        'type': type,
+        'lastMsg': lastMsg,
+        'lastSeen': lastSeen.toIso8601String(),
+      };
+
+  factory _DeviceInfo.fromJson(Map<String, dynamic> json) => _DeviceInfo(
+        id: json['id'] as String,
+        name: json['name'] as String,
+        type: json['type'] as String? ?? 'desktop',
+        lastMsg: json['lastMsg'] as String? ?? '',
+        lastSeen: json['lastSeen'] != null
+            ? DateTime.parse(json['lastSeen'] as String)
+            : null,
+      );
 }
 
 class ChatListPage extends StatefulWidget {
@@ -22,8 +61,10 @@ class ChatListPage extends StatefulWidget {
 class ChatListPageState extends State<ChatListPage> {
   int _currentIndex = 0;
 
-  // 真正的在线设备动态列表
-  final List<Map<String, String>> _realLanDevices = [];
+  // 设备列表（在线 + 缓存的历史设备）
+  final List<_DeviceInfo> _allDevices = [];
+  // 在线设备 ID 集合
+  final Set<String> _onlineDeviceIds = {};
 
   // UDP 局域网通讯配置
   static const int _udpPort = 8888;
@@ -35,6 +76,13 @@ class ChatListPageState extends State<ChatListPage> {
   // 存储本机的所有合法 IPv4，用于精准防自锁
   final List<String> _localIPList = [];
 
+  // 消息服务
+  final UdpMessageService _msgService = UdpMessageService();
+  final MessageCacheService _cacheService = MessageCacheService();
+
+  // 设备列表缓存保存防抖
+  Timer? _saveDebounceTimer;
+
   @override
   void initState() {
     super.initState();
@@ -44,11 +92,14 @@ class ChatListPageState extends State<ChatListPage> {
   @override
   void dispose() {
     _broadcastTimer?.cancel();
-    _closeUdpSocket(); // 确保安全释放旧的 Socket
+    _saveDebounceTimer?.cancel();
+    // 确保最后一次保存完成
+    _saveCachedDeviceListImmediate();
+    _closeUdpSocket();
     super.dispose();
   }
 
-  // 安全关闭并释放旧 Socket 的方法，防止端口残留导致重新扫描时卡死
+  // 安全关闭并释放旧 Socket
   void _closeUdpSocket() {
     try {
       _udpSocket?.close();
@@ -60,11 +111,71 @@ class ChatListPageState extends State<ChatListPage> {
 
   // ================= 初始化入口：设备名与网络发现 =================
   Future<void> _initDeviceAndNetwork() async {
-    await _fetchRealDeviceName(); // 1. 先把真实的设备名字抠出来
-    await _initLanDiscovery(); // 2. 再启动网络引擎
+    await _fetchRealDeviceName();
+    await _loadCachedDevices();
+    await _initLanDiscovery();
   }
 
-  // 💡 核心改动：动态获取真实设备名称
+  // 加载缓存设备列表
+  Future<void> _loadCachedDevices() async {
+    try {
+      final cachedDevices = await _readCachedDeviceList();
+      debugPrint('[DeviceCache] 从缓存加载了 ${cachedDevices.length} 个设备');
+      if (cachedDevices.isNotEmpty && mounted) {
+        setState(() {
+          for (final d in cachedDevices) {
+            if (!_allDevices.any((e) => e.id == d.id)) {
+              _allDevices.add(d);
+              debugPrint('[DeviceCache] 已加载缓存设备: ${d.name} (${d.id})');
+            }
+          }
+        });
+      }
+    } catch (e) {
+      debugPrint("加载缓存设备失败: $e");
+    }
+  }
+
+  // 保存设备列表到本地缓存（带防抖，避免高频写入）
+  void _scheduleSaveDeviceList() {
+    _saveDebounceTimer?.cancel();
+    _saveDebounceTimer = Timer(const Duration(milliseconds: 500), () {
+      _saveCachedDeviceListImmediate();
+    });
+  }
+
+  Future<void> _saveCachedDeviceListImmediate() async {
+    try {
+      final appDir = await _cacheService.getCacheDir();
+      final file = File('$appDir/device_list.json');
+      final jsonList = _allDevices.map((d) => d.toJson()).toList();
+      await file.writeAsString(jsonEncode(jsonList));
+      debugPrint('[DeviceCache] 已保存 ${jsonList.length} 个设备到缓存: $appDir/device_list.json');
+    } catch (e) {
+      debugPrint("保存设备列表失败: $e");
+    }
+  }
+
+  // 读取缓存设备列表
+  Future<List<_DeviceInfo>> _readCachedDeviceList() async {
+    try {
+      final appDir = await _cacheService.getCacheDir();
+      final file = File('$appDir/device_list.json');
+      debugPrint('[DeviceCache] 尝试读取缓存: $appDir/device_list.json (存在=${await file.exists()})');
+      if (!await file.exists()) return [];
+      final content = await file.readAsString();
+      debugPrint('[DeviceCache] 缓存文件大小: ${content.length} 字节');
+      final jsonList = jsonDecode(content) as List<dynamic>;
+      return jsonList
+          .map((j) => _DeviceInfo.fromJson(j as Map<String, dynamic>))
+          .toList();
+    } catch (e) {
+      debugPrint('[DeviceCache] 读取缓存失败: $e');
+      return [];
+    }
+  }
+
+  // 💡 动态获取真实设备名称
   Future<void> _fetchRealDeviceName() async {
     final deviceInfo = DeviceInfoPlugin();
     String detectedName = "未知设备";
@@ -72,19 +183,15 @@ class ChatListPageState extends State<ChatListPage> {
     try {
       if (Platform.isAndroid) {
         final androidInfo = await deviceInfo.androidInfo;
-        // 优先获取用户对手机的命名（生产厂商+营销型号，如 "Xiaomi 14"）
         detectedName = "${androidInfo.manufacturer} ${androidInfo.model}";
       } else if (Platform.isIOS) {
         final iosInfo = await deviceInfo.iosInfo;
-        // iOS 可以直接拿到用户在系统设置里改的个性化名字（如 "张三的 iPhone"）
         detectedName = iosInfo.name;
       } else if (Platform.isWindows) {
         final windowsInfo = await deviceInfo.windowsInfo;
-        // 获取 Windows 的计算机全名（如 "DESKTOP-PC"）
         detectedName = windowsInfo.computerName;
       } else if (Platform.isMacOS) {
         final macosInfo = await deviceInfo.macOsInfo;
-        // 获取 Mac 的计算机名（如 "MacBook Pro"）
         detectedName = macosInfo.computerName;
       } else if (Platform.isLinux) {
         final linuxInfo = await deviceInfo.linuxInfo;
@@ -92,7 +199,6 @@ class ChatListPageState extends State<ChatListPage> {
       }
     } catch (e) {
       debugPrint("读取硬件设备名失败，降级处理: $e");
-      // 兜底降级方案
       detectedName = Platform.isAndroid
           ? "Android 手机"
           : (Platform.isWindows ? "Windows 电脑" : "局域网设备");
@@ -110,22 +216,29 @@ class ChatListPageState extends State<ChatListPage> {
     _closeUdpSocket();
 
     try {
-      String? ip;
+      String? wifiIP;
+      final List<String> allValidIPs = [];
       _localIPList.clear();
 
       // 1. 优先尝试通过网络库获取 Wi-Fi IP
       try {
         final info = NetworkInfo();
-        ip = await info.getWifiIP();
-        if (ip != null && ip != "0.0.0.0") {
-          _localIPList.add(ip);
+        wifiIP = await info.getWifiIP();
+        if (wifiIP != null &&
+            wifiIP != "0.0.0.0" &&
+            (wifiIP.startsWith('192.168.') ||
+                wifiIP.startsWith('10.') ||
+                wifiIP.startsWith('172.'))) {
+          _localIPList.add(wifiIP);
+          allValidIPs.add(wifiIP);
+          debugPrint("WiFi IP (NetworkInfo): $wifiIP");
         }
       } catch (_) {}
 
-      // 2. 遍历底层所有物理网卡，排除虚拟网卡干扰
+      // 2. 遍历底层所有物理网卡
       List<NetworkInterface> interfaces = await NetworkInterface.list(
-        includeLoopback: false, // 排除本地回环 127.0.0.1
-        type: InternetAddressType.IPv4, // 只找有线或无线的 IPv4 地址
+        includeLoopback: false,
+        type: InternetAddressType.IPv4,
       );
 
       for (var interface in interfaces) {
@@ -134,7 +247,18 @@ class ChatListPageState extends State<ChatListPage> {
             name.contains('vbox') ||
             name.contains('vmnet') ||
             name.contains('wsl') ||
-            name.contains('vethernet')) {
+            name.contains('vethernet') ||
+            name.contains('hyper-v') ||
+            name.contains('docker') ||
+            name.contains('vpn') ||
+            name.contains('tunnel') ||
+            name.contains('loopback') ||
+            name.contains('pseudo') ||
+            name.contains('tap') ||
+            name.contains('tun') ||
+            name.contains('bridge') ||
+            name.contains('bluetooth') ||
+            name.contains('usb')) {
           continue;
         }
 
@@ -145,15 +269,23 @@ class ChatListPageState extends State<ChatListPage> {
               addressStr.startsWith('172.')) {
             if (!_localIPList.contains(addressStr)) {
               _localIPList.add(addressStr);
-            }
-            if (ip == null || ip == "0.0.0.0") {
-              ip = addressStr; // 挑选第一个作为展示用的主 IP
+              allValidIPs.add(addressStr);
+              debugPrint("发现物理网卡 IP: $name -> $addressStr");
             }
           }
         }
       }
 
-      if (ip == null) {
+      String? selectedIP = wifiIP;
+      if (selectedIP == null || selectedIP == "0.0.0.0") {
+        selectedIP = allValidIPs.firstWhere(
+          (ip) => ip.startsWith('192.168.'),
+          orElse: () => allValidIPs.isNotEmpty ? allValidIPs.first : '',
+        );
+        if (selectedIP.isEmpty) selectedIP = null;
+      }
+
+      if (selectedIP == null) {
         debugPrint("未能获取到任何有效的局域网网卡 IP");
         setState(() {
           _localIP = "未知IP";
@@ -161,11 +293,13 @@ class ChatListPageState extends State<ChatListPage> {
         return;
       }
 
+      debugPrint("最终选择主 IP: $selectedIP (所有IP: $_localIPList)");
+
       setState(() {
-        _localIP = ip!;
+        _localIP = selectedIP!;
       });
 
-      // 绑定全网卡端口，开启复用
+      // 绑定全网卡端口
       _udpSocket = await RawDatagramSocket.bind(
         InternetAddress.anyIPv4,
         _udpPort,
@@ -173,7 +307,6 @@ class ChatListPageState extends State<ChatListPage> {
       );
       _udpSocket?.broadcastEnabled = true;
 
-      // 强行加入固定组播组 224.0.0.1，防范 Android 硬件级广播锁
       try {
         _udpSocket?.joinMulticast(InternetAddress('224.0.0.1'));
         debugPrint("强行加入组播组 224.0.0.1 成功");
@@ -181,13 +314,23 @@ class ChatListPageState extends State<ChatListPage> {
         debugPrint("加入组播组失败（非关键阻碍，继续执行）: $e");
       }
 
-      // 监听接收函数
+      _msgService.attachToExisting(_udpSocket!, _localIP);
+
+      // 注册设备状态变更回调（心跳超时）
+      _msgService.setDeviceStatusCallback((deviceId, status) {
+        if (status == DeviceOnlineStatus.offline) {
+          _onDeviceOffline(deviceId);
+        }
+      });
+
       _udpSocket?.listen((RawSocketEvent event) {
         if (event == RawSocketEvent.read) {
           Datagram? dg = _udpSocket?.receive();
           if (dg != null) {
             String rawData = utf8.decode(dg.data);
+            debugPrint("【UDP原始层】收到 ${dg.data.length} 字节来自 ${dg.address.address}:${dg.port}");
             _handleIncomingBroadcast(rawData, dg.address.address);
+            _msgService.handleRawData(rawData, dg.address.address);
           }
         }
       });
@@ -198,6 +341,20 @@ class ChatListPageState extends State<ChatListPage> {
     }
   }
 
+  // 设备离线处理
+  void _onDeviceOffline(String deviceId) {
+    if (!mounted) return;
+    setState(() {
+      _onlineDeviceIds.remove(deviceId);
+      final idx = _allDevices.indexWhere((d) => d.id == deviceId);
+      if (idx != -1) {
+        _allDevices[idx].onlineStatus = DeviceOnlineStatus.offline;
+        _allDevices[idx].lastMsg = "设备已离线";
+      }
+    });
+    _scheduleSaveDeviceList();
+  }
+
   // 定时发送广播 + 组播
   void _startAdvertising() {
     _broadcastTimer?.cancel();
@@ -206,7 +363,7 @@ class ChatListPageState extends State<ChatListPage> {
 
       Map<String, String> myInfo = {
         "id": _localIP,
-        "name": _myDeviceName, // 这里发送的是上面动态抠出来的真实设备名
+        "name": _myDeviceName,
         "type": PlatformMobileExtension.isMobile ? "mobile" : "desktop",
         "cmd": "iamalive",
       };
@@ -215,14 +372,12 @@ class ChatListPageState extends State<ChatListPage> {
         String jsonStr = jsonEncode(myInfo);
         List<int> dataToSend = utf8.encode(jsonStr);
 
-        // 1. 发送标准全网广播（覆盖桌面端、部分宽松的移动端）
         _udpSocket?.send(
           dataToSend,
           InternetAddress('255.255.255.255'),
           _udpPort,
         );
 
-        // 2. 追加发送通用组播（穿透手机端广播屏蔽锁）
         _udpSocket?.send(dataToSend, InternetAddress('224.0.0.1'), _udpPort);
       } catch (e) {
         debugPrint("发送心跳失败: $e");
@@ -230,12 +385,11 @@ class ChatListPageState extends State<ChatListPage> {
     });
   }
 
-  // 处理接收逻辑：支持 iamalive（盲发心跳） 和 i_see_you（单播定向回传应答）
+  // 处理接收逻辑
   void _handleIncomingBroadcast(String rawData, String senderIP) {
-    debugPrint("【网络层拦截】收到来自 $senderIP 的原始包 -> $rawData");
-
-    // 防回路自激拦截
-    if (_localIPList.contains(senderIP)) return;
+    if (_localIPList.contains(senderIP)) {
+      return;
+    }
 
     try {
       dynamic decodedData = jsonDecode(rawData);
@@ -247,7 +401,6 @@ class ChatListPageState extends State<ChatListPage> {
       Map<String, dynamic> deviceData = Map<String, dynamic>.from(decodedData);
       String cmd = deviceData['cmd'] ?? '';
 
-      // 支持普通心跳包与精准单播响应包
       if (cmd == 'iamalive' || cmd == 'i_see_you') {
         String id = deviceData['id'] ?? senderIP;
         if (_localIPList.contains(id)) return;
@@ -255,32 +408,38 @@ class ChatListPageState extends State<ChatListPage> {
         String name = deviceData['name'] ?? "未知设备";
         String type = deviceData['type'] ?? "mobile";
 
-        // 💡 核心机制：如果 Windows 电脑发现了手机的心跳，立刻对手机的 IP 进行点名“单播响应”
-        // 这一步能彻底斩断由于路由器 AP 隔离或 Android 限制导致的单向失联
+        // 记录心跳
+        _msgService.recordHeartbeat(id);
+
+        // 桌面端对手机端进行单播响应
         if (cmd == 'iamalive' &&
             !PlatformMobileExtension.isMobile &&
             type == 'mobile') {
           _sendDirectReply(senderIP);
         }
 
-        int existingIndex = _realLanDevices.indexWhere(
-          (element) => element['id'] == id,
-        );
-
         setState(() {
+          _onlineDeviceIds.add(id);
+          final existingIndex = _allDevices.indexWhere((d) => d.id == id);
           if (existingIndex != -1) {
-            _realLanDevices[existingIndex]['name'] = name;
-            _realLanDevices[existingIndex]['lastMsg'] = "在线 (已同步)";
+            _allDevices[existingIndex].name = name;
+            _allDevices[existingIndex].type = type;
+            _allDevices[existingIndex].onlineStatus = DeviceOnlineStatus.online;
+            _allDevices[existingIndex].lastSeen = DateTime.now();
+            _allDevices[existingIndex].lastMsg =
+                cmd == 'i_see_you' ? "已通过单播握手成功" : "在线";
           } else {
-            _realLanDevices.add({
-              "id": id,
-              "name": name,
-              "type": type,
-              "lastMsg": cmd == 'i_see_you' ? "已通过单播握手成功" : "刚刚上线，点击开始传输",
-            });
+            _allDevices.add(_DeviceInfo(
+              id: id,
+              name: name,
+              type: type,
+              lastMsg: cmd == 'i_see_you' ? "已通过单播握手成功" : "刚刚上线",
+              onlineStatus: DeviceOnlineStatus.online,
+            ));
             debugPrint("🎉 成功跨端上线设备: $name ($id)");
           }
         });
+        _scheduleSaveDeviceList();
       }
     } catch (e) {
       debugPrint("协议数据解析出现坏损丢弃: $e");
@@ -293,7 +452,7 @@ class ChatListPageState extends State<ChatListPage> {
       "id": _localIP,
       "name": _myDeviceName,
       "type": PlatformMobileExtension.isMobile ? "mobile" : "desktop",
-      "cmd": "i_see_you", // 声明这是定向回应包
+      "cmd": "i_see_you",
     };
 
     try {
@@ -306,16 +465,64 @@ class ChatListPageState extends State<ChatListPage> {
   }
 
   void _refreshDevices() {
+    // 不清除 _allDevices，保留缓存设备（仅清除在线状态，重新扫描会更新）
     setState(() {
-      _realLanDevices.clear();
+      _onlineDeviceIds.clear();
+      // 将所有设备标记为 unknown，等扫描到后再更新为 online
+      for (final d in _allDevices) {
+        d.onlineStatus = DeviceOnlineStatus.unknown;
+        d.lastMsg = '正在扫描...';
+      }
     });
-    _initDeviceAndNetwork();
+    _initLanDiscovery();
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        content: Text('正在重新初始化并扫描局域网...'),
+        content: Text('正在重新扫描局域网...'),
         duration: Duration(seconds: 1),
       ),
     );
+  }
+
+  // 清除所有聊天记录
+  Future<void> _clearAllChatHistory() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('清除聊天记录'),
+        content: const Text('确定要清除所有设备的聊天记录吗？\n\n此操作不会删除设备记录，仅清空聊天消息缓存。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
+            child: const Text('确定清除'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      try {
+        await _cacheService.clearAllMessages();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('所有聊天记录已清除'),
+              duration: Duration(seconds: 1),
+            ),
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('清除失败: $e')),
+          );
+        }
+      }
+    }
   }
 
   @override
@@ -354,8 +561,18 @@ class ChatListPageState extends State<ChatListPage> {
     );
   }
 
-  // ================= 消息 Tab 页（真实设备列表） =================
+  // ================= 消息 Tab 页（美化后的设备列表） =================
   Widget _buildMessageTab() {
+    // 排序：在线设备在前，按名字排序
+    final sortedDevices = List<_DeviceInfo>.from(_allDevices);
+    sortedDevices.sort((a, b) {
+      final aOnline = _onlineDeviceIds.contains(a.id);
+      final bOnline = _onlineDeviceIds.contains(b.id);
+      if (aOnline && !bOnline) return -1;
+      if (!aOnline && bOnline) return 1;
+      return a.name.compareTo(b.name);
+    });
+
     return Scaffold(
       backgroundColor: const Color(0xFFEDF0F3),
       appBar: AppBar(
@@ -375,7 +592,7 @@ class ChatListPageState extends State<ChatListPage> {
           ),
         ],
       ),
-      body: _realLanDevices.isEmpty
+      body: sortedDevices.isEmpty
           ? Center(
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -395,7 +612,7 @@ class ChatListPageState extends State<ChatListPage> {
               ),
             )
           : ListView.separated(
-              itemCount: _realLanDevices.length,
+              itemCount: sortedDevices.length,
               separatorBuilder: (context, index) => const Divider(
                 height: 1,
                 thickness: 0.5,
@@ -403,90 +620,160 @@ class ChatListPageState extends State<ChatListPage> {
                 color: Color(0xFFE5E5E5),
               ),
               itemBuilder: (context, index) {
-                final device = _realLanDevices[index];
-                IconData deviceIcon = Icons.devices;
-                if (device['type'] == 'mobile') {
-                  deviceIcon = Icons.phone_android;
-                }
-                if (device['type'] == 'desktop') deviceIcon = Icons.computer;
+                final device = sortedDevices[index];
+                final isOnline = _onlineDeviceIds.contains(device.id);
 
-                return InkWell(
-                  onTap: () {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) =>
-                            ChatPage(id: device['id']!, title: device['name']!),
-                      ),
-                    );
-                  },
-                  child: Container(
-                    color: Colors.white,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 12,
-                    ),
-                    child: Row(
-                      children: [
-                        Container(
-                          width: 48,
-                          height: 48,
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFE1E1E1),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Icon(
-                            deviceIcon,
-                            color: Colors.black54,
-                            size: 26,
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                mainAxisAlignment:
-                                    MainAxisAlignment.spaceBetween,
-                                children: [
-                                  Text(
-                                    device['name']!,
-                                    style: const TextStyle(
-                                      fontSize: 16.5,
-                                      fontWeight: FontWeight.w500,
-                                      color: Colors.black,
-                                    ),
-                                  ),
-                                  Text(
-                                    device['id']!,
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      color: Colors.grey[500],
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 5),
-                              Text(
-                                device['lastMsg']!,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontSize: 13.5,
-                                  color: Colors.grey[600],
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                );
+                return _buildDeviceItem(device, isOnline);
               },
             ),
     );
+  }
+
+  Widget _buildDeviceItem(_DeviceInfo device, bool isOnline) {
+    IconData deviceIcon;
+    Color iconBgColor;
+    Color iconColor;
+
+    if (device.type == 'mobile') {
+      deviceIcon = Icons.phone_android;
+      iconBgColor = isOnline ? const Color(0xFFE8F5E9) : const Color(0xFFF5F5F5);
+      iconColor = isOnline ? const Color(0xFF07C160) : Colors.grey;
+    } else {
+      deviceIcon = Icons.computer;
+      iconBgColor = isOnline ? const Color(0xFFE3F2FD) : const Color(0xFFF5F5F5);
+      iconColor = isOnline ? const Color(0xFF1976D2) : Colors.grey;
+    }
+
+    return InkWell(
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => ChatPage(
+              id: device.id,
+              title: device.name,
+              msgService: _msgService,
+              myDeviceName: _myDeviceName,
+            ),
+          ),
+        );
+      },
+      child: Container(
+        color: isOnline ? const Color(0xFFF9FFF9) : Colors.white,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        child: Row(
+          children: [
+            // 头像区域 - 带在线状态指示
+            Stack(
+              children: [
+                Container(
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: iconBgColor,
+                    borderRadius: BorderRadius.circular(12),
+                    border: isOnline
+                        ? Border.all(
+                            color: const Color(0xFF07C160).withValues(alpha: 0.3),
+                            width: 1.5)
+                        : null,
+                  ),
+                  child: Icon(deviceIcon, color: iconColor, size: 24),
+                ),
+                if (isOnline)
+                  Positioned(
+                    right: 0,
+                    bottom: 0,
+                    child: Container(
+                      width: 14,
+                      height: 14,
+                      decoration: const BoxDecoration(
+                        color: Color(0xFF07C160),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(Icons.check, size: 10, color: Colors.white),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          device.name,
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: isOnline ? FontWeight.w600 : FontWeight.w500,
+                            color: isOnline ? Colors.black87 : Colors.black54,
+                          ),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      if (isOnline)
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF07C160).withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: const Text(
+                            '在线',
+                            style: TextStyle(
+                              fontSize: 10,
+                              color: Color(0xFF07C160),
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        )
+                      else
+                        Text(
+                          _formatLastSeen(device.lastSeen),
+                          style: TextStyle(fontSize: 11, color: Colors.grey[400]),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Row(
+                    children: [
+                      Text(
+                        device.id,
+                        style: TextStyle(fontSize: 12, color: Colors.grey[400]),
+                      ),
+                      const Spacer(),
+                      Text(
+                        device.lastMsg,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12.5,
+                          color: isOnline ? Colors.grey[600] : Colors.grey[400],
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatLastSeen(DateTime dt) {
+    final diff = DateTime.now().difference(dt);
+    if (diff.inMinutes < 1) return '刚刚';
+    if (diff.inMinutes < 60) return '${diff.inMinutes}分钟前';
+    if (diff.inHours < 24) return '${diff.inHours}小时前';
+    if (diff.inDays < 7) return '${diff.inDays}天前';
+    return '${dt.month}/${dt.day}';
   }
 
   // ================= 设置 Tab 页 =================
@@ -555,16 +842,15 @@ class ChatListPageState extends State<ChatListPage> {
               ),
             ),
             const SizedBox(height: 12),
-            _buildSettingCell('传输保存路径', value: '/storage/emulated/0/Download'),
-            const Divider(
-              height: 0.5,
-              thickness: 0.5,
-              indent: 16,
-              color: Color(0xFFE5E5E5),
+            // 清除聊天记录（替代原"清空所有传输历史"）
+            GestureDetector(
+              onTap: _clearAllChatHistory,
+              child: _buildSettingCell(
+                '清除所有聊天记录',
+                textColor: Colors.redAccent,
+                showArrow: false,
+              ),
             ),
-            _buildSettingCell('自动接收小文件', isSwitch: true, switchValue: true),
-            const SizedBox(height: 12),
-            _buildSettingCell('清空所有传输历史', textColor: Colors.redAccent),
             const Divider(
               height: 0.5,
               thickness: 0.5,
@@ -584,6 +870,7 @@ class ChatListPageState extends State<ChatListPage> {
     bool isSwitch = false,
     bool switchValue = false,
     Color textColor = Colors.black87,
+    bool showArrow = true,
   }) {
     return Container(
       color: Colors.white,
@@ -616,12 +903,14 @@ class ChatListPageState extends State<ChatListPage> {
                         ),
                       ),
                     ),
-                  const SizedBox(width: 4),
-                  const Icon(
-                    Icons.arrow_forward_ios,
-                    size: 14,
-                    color: Colors.grey,
-                  ),
+                  if (showArrow) ...[
+                    const SizedBox(width: 4),
+                    const Icon(
+                      Icons.arrow_forward_ios,
+                      size: 14,
+                      color: Colors.grey,
+                    ),
+                  ],
                 ],
               ),
             ),

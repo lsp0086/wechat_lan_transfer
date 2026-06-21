@@ -1,19 +1,28 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
 import '../Model/chat_model.dart';
 import '../Services/file_transfer_service.dart';
 import '../Services/message_cache_service.dart';
+import '../Services/udp_message_service.dart';
 import 'chat_more_page.dart';
 import 'chat_info_page.dart';
 
 class ChatPage extends StatefulWidget {
   final String title;
   final String id;
+  final UdpMessageService msgService;
+  final String myDeviceName;
 
-  ChatPage({required this.id, required this.title});
+  const ChatPage({super.key, 
+    required this.id,
+    required this.title,
+    required this.msgService,
+    required this.myDeviceName,
+  });
 
   @override
   _ChatPageState createState() => _ChatPageState();
@@ -24,63 +33,86 @@ class _ChatPageState extends State<ChatPage> {
   List<String> _emojiList = [];
   bool _isVoice = false;
   bool _isMore = false;
-  double keyboardHeight = 270.0;
   bool _emojiState = false;
 
   final TextEditingController _textController = TextEditingController();
   final FocusNode _focusNode = FocusNode();
   final ScrollController _scrollController = ScrollController();
 
+  // 面板可见性由 _emojiState 和 _isMore 直接决定
+
   // 服务层
   final FileTransferService _transferService = FileTransferService();
   final MessageCacheService _cacheService = MessageCacheService();
   final ImagePicker _imagePicker = ImagePicker();
 
+  // 自动接收文件（默认开启），从 ChatInfoPage 同步
+  bool _autoReceive = true;
+
   StreamSubscription<FileTransferTask>? _progressSubscription;
   StreamSubscription<FileTransferTask>? _newTaskSubscription;
+  StreamSubscription<ReceivedMessage>? _msgSubscription;
 
   @override
   void initState() {
     super.initState();
-    _emojiList = List.generate(
-      1212,
-      (index) => String.fromCharCode(0x1F601 + index),
-    );
+    // 精选常用 emoji，避免 Unicode 空白区间产生空表情
+    _emojiList = _buildEmojiList();
 
-    _focusNode.addListener(() {
-      if (_focusNode.hasFocus) {
-        setState(() {
-          _emojiState = false;
-          _isMore = false;
-        });
-      }
-    });
+    // 监听焦点变化：键盘弹起时自动收起面板
+    _focusNode.addListener(_onFocusChanged);
 
     _initChat();
   }
 
-  Future<void> _initChat() async {
-    // 1. 启动文件接收服务器
-    await _transferService.startServer();
+  void _onFocusChanged() {
+    setState(() {
+      if (_focusNode.hasFocus) {
+        _emojiState = false;
+        _isMore = false;
+      }
+    });
+  }
 
-    // 2. 监听新接收文件
+  Future<void> _initChat() async {
+    // 1. 先设置好所有监听，不阻塞 UI
     _newTaskSubscription = _transferService.newTaskStream.listen((task) {
       _onFileReceived(task);
     });
-
-    // 3. 监听传输进度更新
     _progressSubscription = _transferService.progressStream.listen((task) {
       _updateTransferProgress(task);
     });
+    _msgSubscription = widget.msgService.messageStream.listen((msg) {
+      _handleIncomingMessage(msg);
+    });
 
-    // 4. 从缓存加载聊天记录
+    // 2. 从缓存加载聊天记录（不依赖网络，先显示）
     final cachedMessages = await _cacheService.loadMessages(widget.id);
     if (cachedMessages.isNotEmpty) {
+      // 从缓存恢复后，将所有传输中/pending 的消息标记为失败
+      // 避免之前异常退出导致的消息卡在"传输中"状态
+      bool hasChanges = false;
+      final fixedMessages = cachedMessages.map((m) {
+        if (m.transferState == TransferState.transferring ||
+            m.transferState == TransferState.pending) {
+          hasChanges = true;
+          return m.copyWith(
+            content: m.isMe
+                ? '📤 发送中断: ${m.fileName ?? ""}'
+                : '📥 接收中断: ${m.fileName ?? ""}',
+            transferState: TransferState.failed,
+          );
+        }
+        return m;
+      }).toList();
       setState(() {
-        chatData = cachedMessages;
+        chatData = fixedMessages;
       });
+      // 写回缓存，避免下次进入时重复处理
+      if (hasChanges) {
+        await _cacheService.saveMessages(widget.id, fixedMessages);
+      }
     } else {
-      // 首次进入，插入系统消息
       final initMsg = ChatMessage(
         id: 'init_${DateTime.now().millisecondsSinceEpoch}',
         senderId: widget.id,
@@ -94,12 +126,148 @@ class _ChatPageState extends State<ChatPage> {
       });
       _cacheService.appendMessage(widget.id, initMsg);
     }
+    _scrollToBottom();
 
+    // 3. 后台启动文件接收服务器（可能慢，不阻塞 UI）
+    _transferService.startServer().catchError((e) {
+      debugPrint('启动文件服务器失败: $e');
+    });
+  }
+
+  // ========== 处理 UDP 消息通道的入站消息 ==========
+  void _handleIncomingMessage(ReceivedMessage msg) {
+    debugPrint('[ChatPage] 收到入站消息: cmd=${msg.cmd}, senderIp=${msg.senderIp}, currentChatId=${widget.id}');
+    // 只处理来自当前对话设备的消息
+    if (msg.senderIp != widget.id) {
+      debugPrint('[ChatPage] 消息来自 ${msg.senderIp}，当前对话是 ${widget.id}，忽略');
+      return;
+    }
+
+    switch (msg.cmd) {
+      case UdpCmd.textMessage:
+        _onTextMessageReceived(msg);
+        break;
+      case UdpCmd.fileNotify:
+        _onFileNotifyReceived(msg);
+        break;
+      case UdpCmd.fileAccept:
+        // 发送方收到接收确认：可能是初始确认（TCP 已自动开始），
+        // 也可能是接收方请求重新发送之前被拒绝的文件
+        _onFileAcceptReceived(msg);
+        break;
+      case UdpCmd.fileReject:
+        _onFileRejectReceived(msg);
+        break;
+    }
+  }
+
+  /// 收到文字消息
+  void _onTextMessageReceived(ReceivedMessage msg) {
+    final newMsg = ChatMessage(
+      id: 'recv_text_${DateTime.now().millisecondsSinceEpoch}',
+      senderId: widget.id,
+      content: msg.payload['content'] as String? ?? '',
+      type: MessageType.text,
+      timestamp: DateTime.now(),
+      isMe: false,
+    );
+
+    setState(() {
+      chatData.add(newMsg);
+    });
+    _cacheService.appendMessage(widget.id, newMsg);
     _scrollToBottom();
   }
 
-  // ========== 文件接收回调 ==========
+  /// 收到文件传输通知（对方即将通过 TCP 发文件过来）
+  void _onFileNotifyReceived(ReceivedMessage msg) {
+    final fileName = msg.payload['fileName'] as String? ?? '未知文件';
+
+    // 发送确认回复，让发送方开始 TCP 传输
+    widget.msgService.sendFileAccept(
+      targetIp: widget.id,
+      originalFileName: fileName,
+    );
+
+    // 不在这里创建消息，等 TCP 层 _onFileReceived 时统一创建唯一的一条消息
+    // 避免出现 UDP 通知消息和 TCP 传输消息两条重复的 bug
+  }
+
+  /// 收到文件接收确认（接收方请求重新发送之前被拒绝的文件）
+  void _onFileAcceptReceived(ReceivedMessage msg) {
+    final fileName = msg.payload['fileName'] as String? ?? '';
+
+    // 查找最近一条发送给该设备的、该文件名的、失败的消息，尝试重新发送
+    ChatMessage? targetMsg;
+    int targetIndex = -1;
+    for (int i = chatData.length - 1; i >= 0; i--) {
+      final m = chatData[i];
+      if (m.isMe &&
+          (m.type == MessageType.file || m.type == MessageType.image) &&
+          m.fileName == fileName &&
+          m.transferState == TransferState.failed &&
+          m.filePath != null) {
+        targetMsg = m;
+        targetIndex = i;
+        break;
+      }
+    }
+
+    if (targetMsg != null) {
+      debugPrint('[ChatPage] 收到重新发送请求: $fileName，重新发送');
+      // 更新消息为传输中
+      setState(() {
+        chatData[targetIndex] = targetMsg!.copyWith(
+          content: '📤 重新发送中: ${targetMsg.fileName}',
+          transferState: TransferState.transferring,
+          progress: 0.0,
+        );
+      });
+      _cacheService.updateMessage(widget.id, targetMsg.id, chatData[targetIndex]);
+
+      // 重新发送
+      _sendFileFromPath(
+        targetMsg.filePath!,
+        targetMsg.fileName ?? 'file',
+        isImage: targetMsg.type == MessageType.image,
+      );
+    }
+  }
+
+  /// 收到文件传输拒绝（接收方拒绝了传输）
+  void _onFileRejectReceived(ReceivedMessage msg) {
+    final fileName = msg.payload['fileName'] as String? ?? '未知文件';
+
+    // 查找最近一条发送给该设备的文件消息，将其标记为失败（红色气泡）
+    setState(() {
+      for (int i = chatData.length - 1; i >= 0; i--) {
+        final m = chatData[i];
+        if (m.isMe &&
+            m.type == MessageType.file &&
+            m.fileName == fileName &&
+            m.transferState == TransferState.transferring) {
+          chatData[i] = m.copyWith(
+            content: '📤 对方拒绝接收: $fileName',
+            transferState: TransferState.failed,
+          );
+          _cacheService.updateMessage(widget.id, m.id, chatData[i]);
+          break;
+        }
+      }
+    });
+
+    debugPrint('[ChatPage] 对方拒绝接收文件: $fileName');
+  }
+
+  // ========== 文件接收回调（TCP 层实际开始接收文件） ==========
   void _onFileReceived(FileTransferTask task) {
+    // 防止同一个 taskId 重复创建消息气泡
+    final existingIndex = chatData.indexWhere((m) => m.taskId == task.id);
+    if (existingIndex != -1) {
+      debugPrint('[ChatPage] taskId=${task.id} 已存在消息，跳过重复创建');
+      return;
+    }
+
     final msg = ChatMessage(
       id: 'recv_${task.id}',
       senderId: widget.id,
@@ -122,10 +290,47 @@ class _ChatPageState extends State<ChatPage> {
     _scrollToBottom();
   }
 
+  // ========== 取消传输 ==========
+  void _cancelTransfer(ChatMessage msg) {
+    if (msg.taskId == null) return;
+
+    // 取消 TCP 传输任务
+    _transferService.cancelTransfer(msg.taskId!);
+
+    // 如果是我发起的，通知对方拒绝接收
+    if (msg.isMe) {
+      widget.msgService.sendFileReject(
+        targetIp: widget.id,
+        originalFileName: msg.fileName ?? '',
+      );
+    }
+
+    // 更新本地消息为红色气泡
+    setState(() {
+      final index = chatData.indexWhere((m) => m.id == msg.id);
+      if (index != -1) {
+        chatData[index] = msg.copyWith(
+          content: msg.isMe
+              ? '📤 已取消发送: ${msg.fileName ?? ''}'
+              : '📥 已拒绝接收: ${msg.fileName ?? ''}',
+          transferState: TransferState.failed,
+        );
+        _cacheService.updateMessage(widget.id, msg.id, chatData[index]);
+      }
+    });
+  }
+
   // ========== 更新传输进度 ==========
   void _updateTransferProgress(FileTransferTask task) {
     final index = chatData.indexWhere((m) => m.taskId == task.id);
     if (index == -1) return;
+
+    // 防止已完成/已失败的消息被回退到传输中状态
+    final currentMsg = chatData[index];
+    if (currentMsg.transferState == TransferState.completed ||
+        currentMsg.transferState == TransferState.failed) {
+      return;
+    }
 
     TransferState state;
     switch (task.status) {
@@ -195,6 +400,17 @@ class _ChatPageState extends State<ChatPage> {
       if (result != null && result.files.single.path != null) {
         PlatformFile file = result.files.single;
 
+        // 先通过 UDP 通知对方即将发送文件
+        await widget.msgService.sendFileNotify(
+          targetIp: widget.id,
+          fileName: file.name,
+          fileSize: file.size,
+          senderName: widget.myDeviceName,
+        );
+
+        // 短暂延迟等对方确认，然后开始 TCP 传输
+        await Future.delayed(const Duration(milliseconds: 300));
+
         // 发送文件
         final task = await _transferService.sendFile(
           filePath: file.path!,
@@ -235,36 +451,27 @@ class _ChatPageState extends State<ChatPage> {
     }
   }
 
-  // ========== 图片选择器（相册） ==========
+  // ========== 图片选择器（相册）- 用 file_picker 选择原始文件 ==========
+  // 避免 image_picker 对 GIF 等格式重新编码导致模糊/丢失动画
   Future<void> _pickImageFromGallery() async {
     try {
-      final XFile? image = await _imagePicker.pickImage(
-        source: ImageSource.gallery,
-        imageQuality: 90,
+      FilePickerResult? result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: [
+          'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp',
+          'heic', 'heif', 'svg',
+        ],
+        allowMultiple: false,
       );
 
-      if (image != null) {
-        // 先显示图片消息
-        final imgMsg = ChatMessage(
-          id: 'img_${DateTime.now().millisecondsSinceEpoch}',
-          senderId: 'me',
-          content: '📷 图片',
-          type: MessageType.image,
-          timestamp: DateTime.now(),
-          isMe: true,
-          fileName: image.name,
-          filePath: image.path,
-          imagePath: image.path,
-          transferState: TransferState.completed,
-        );
+      if (result != null && result.files.single.path != null) {
+        final file = result.files.single;
+        final ext = file.extension?.toLowerCase() ?? '';
+        final isImage = [
+          'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'heic', 'heif', 'svg'
+        ].contains(ext);
 
-        setState(() {
-          chatData.add(imgMsg);
-        });
-        _cacheService.appendMessage(widget.id, imgMsg);
-
-        // 然后发送图片文件
-        _sendFileFromPath(image.path, image.name);
+        await _sendFileFromPath(file.path!, file.name, isImage: isImage);
       }
     } catch (e) {
       debugPrint("选择图片失败: $e");
@@ -280,25 +487,7 @@ class _ChatPageState extends State<ChatPage> {
       );
 
       if (photo != null) {
-        final imgMsg = ChatMessage(
-          id: 'cam_${DateTime.now().millisecondsSinceEpoch}',
-          senderId: 'me',
-          content: '📸 拍摄的照片',
-          type: MessageType.image,
-          timestamp: DateTime.now(),
-          isMe: true,
-          fileName: photo.name,
-          filePath: photo.path,
-          imagePath: photo.path,
-          transferState: TransferState.completed,
-        );
-
-        setState(() {
-          chatData.add(imgMsg);
-        });
-        _cacheService.appendMessage(widget.id, imgMsg);
-
-        _sendFileFromPath(photo.path, photo.name);
+        await _sendFileFromPath(photo.path, photo.name, isImage: true);
       }
     } catch (e) {
       debugPrint("拍照失败: $e");
@@ -306,16 +495,73 @@ class _ChatPageState extends State<ChatPage> {
   }
 
   // ========== 发送文件（通用） ==========
-  Future<void> _sendFileFromPath(String filePath, String fileName) async {
+  Future<void> _sendFileFromPath(String filePath, String fileName, {bool isImage = false}) async {
     try {
-      await _transferService.sendFile(
+      final file = File(filePath);
+      final fileSize = await file.length();
+
+      // 先通过 UDP 通知对方
+      await widget.msgService.sendFileNotify(
+        targetIp: widget.id,
+        fileName: fileName,
+        fileSize: fileSize,
+        senderName: widget.myDeviceName,
+      );
+
+      await Future.delayed(const Duration(milliseconds: 300));
+
+      final task = await _transferService.sendFile(
         filePath: filePath,
         targetIp: widget.id,
         customFileName: fileName,
       );
-      // 进度更新由 _progressSubscription 统一处理
+
+      // 创建一条文件消息，绑定 taskId，进度由 _progressSubscription 统一更新
+      if (task != null) {
+        final fileMsg = ChatMessage(
+          id: 'send_${task.id}',
+          senderId: 'me',
+          content: _buildFileSendContent(task),
+          type: isImage ? MessageType.image : MessageType.file,
+          fileName: fileName,
+          fileSize: _formatFileSize(fileSize),
+          filePath: filePath,
+          imagePath: isImage ? filePath : null,
+          timestamp: DateTime.now(),
+          isMe: true,
+          progress: task.progress,
+          transferState: TransferState.transferring,
+          taskId: task.id,
+        );
+
+        setState(() {
+          chatData.add(fileMsg);
+        });
+        _cacheService.appendMessage(widget.id, fileMsg);
+        _scrollToBottom();
+      }
     } catch (e) {
       debugPrint("发送文件失败: $e");
+      if (mounted) {
+        final errMsg = ChatMessage(
+          id: 'err_${DateTime.now().millisecondsSinceEpoch}',
+          senderId: 'me',
+          content: '📤 发送失败: $fileName',
+          type: isImage ? MessageType.image : MessageType.file,
+          fileName: fileName,
+          filePath: filePath,
+          imagePath: isImage ? filePath : null,
+          timestamp: DateTime.now(),
+          isMe: true,
+          transferState: TransferState.failed,
+        );
+
+        setState(() {
+          chatData.add(errMsg);
+        });
+        _cacheService.appendMessage(widget.id, errMsg);
+        _scrollToBottom();
+      }
     }
   }
 
@@ -359,6 +605,11 @@ class _ChatPageState extends State<ChatPage> {
     if (text.trim().isEmpty) return;
     _textController.clear();
 
+    debugPrint('[ChatPage] ====== 发送文字消息 ======');
+    debugPrint('[ChatPage] 目标IP: ${widget.id}');
+    debugPrint('[ChatPage] 内容: "$text"');
+    debugPrint('[ChatPage] 消息服务状态: running=${widget.msgService.isRunning}, localIP=${widget.msgService.localIP}');
+
     final newMsg = ChatMessage(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       senderId: 'me',
@@ -373,33 +624,43 @@ class _ChatPageState extends State<ChatPage> {
     });
     _cacheService.appendMessage(widget.id, newMsg);
     _scrollToBottom();
+
+    // 通过网络发送文字消息
+    widget.msgService.sendTextMessage(
+      targetIp: widget.id,
+      content: text,
+      senderName: widget.myDeviceName,
+    );
   }
 
   void onTapMore() {
     setState(() {
       _isVoice = false;
-      if (_focusNode.hasFocus) {
-        _focusNode.unfocus();
-        _isMore = true;
-      } else {
-        _isMore = !_isMore;
-      }
       _emojiState = false;
+      if (_isMore) {
+        _isMore = false;
+        _focusNode.requestFocus();
+      } else {
+        if (_focusNode.hasFocus) {
+          _focusNode.unfocus();
+        }
+        _isMore = true;
+      }
     });
   }
 
   void onTapEmoji() {
     setState(() {
       _isVoice = false;
-      if (_isMore) {
-        _emojiState = true;
-        _isMore = false;
-      } else {
-        _emojiState = !_emojiState;
-      }
-
+      _isMore = false;
       if (_emojiState) {
-        _focusNode.unfocus();
+        _emojiState = false;
+        _focusNode.requestFocus();
+      } else {
+        if (_focusNode.hasFocus) {
+          _focusNode.unfocus();
+        }
+        _emojiState = true;
       }
     });
   }
@@ -427,12 +688,11 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   Widget build(BuildContext context) {
-    if (keyboardHeight == 270.0 &&
-        MediaQuery.of(context).viewInsets.bottom != 0) {
-      keyboardHeight = MediaQuery.of(context).viewInsets.bottom;
-    }
+    // 面板高度固定为屏幕高度的 0.4 倍，不再依赖键盘高度
+    final panelHeight = MediaQuery.of(context).size.height * 0.4;
 
     return Scaffold(
+      resizeToAvoidBottomInset: false,
       backgroundColor: const Color(0xFFEDF0F3),
       appBar: AppBar(
         title: Text(widget.title),
@@ -447,14 +707,23 @@ class _ChatPageState extends State<ChatPage> {
         actions: [
           IconButton(
             icon: const Icon(Icons.more_horiz),
-            onPressed: () {
-              Navigator.push(
+            onPressed: () async {
+              final result = await Navigator.push<bool>(
                 context,
                 MaterialPageRoute(
-                  builder: (_) =>
-                      ChatInfoPage(id: widget.id, name: widget.title),
+                  builder: (_) => ChatInfoPage(
+                    id: widget.id,
+                    name: widget.title,
+                    cacheService: _cacheService,
+                    initialAutoReceive: _autoReceive,
+                  ),
                 ),
               );
+              if (result != null && mounted) {
+                setState(() {
+                  _autoReceive = result;
+                });
+              }
             },
           ),
         ],
@@ -465,10 +734,6 @@ class _ChatPageState extends State<ChatPage> {
             child: GestureDetector(
               onTap: () {
                 _focusNode.unfocus();
-                setState(() {
-                  _isMore = false;
-                  _emojiState = false;
-                });
               },
               child: ListView.builder(
                 controller: _scrollController,
@@ -482,21 +747,20 @@ class _ChatPageState extends State<ChatPage> {
           ),
           _buildInputBar(),
           Visibility(
-            visible: _emojiState && !_focusNode.hasFocus,
+            visible: _emojiState,
             child: Container(
-              height: keyboardHeight,
+              height: panelHeight,
               color: const Color(0xFFF6F6F6),
               child: _buildEmojiWidget(),
             ),
           ),
           Visibility(
-            visible: _isMore && !_focusNode.hasFocus,
+            visible: _isMore,
             child: Container(
-              height: keyboardHeight,
+              height: panelHeight,
               color: const Color(0xFFF6F6F6),
               child: ChatMorePage(
                 id: widget.id,
-                keyboardHeight: keyboardHeight,
                 onFileSelected: _openFilePicker,
                 onPickImage: _pickImageFromGallery,
                 onTakePhoto: _takePhoto,
@@ -553,8 +817,11 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
-  /// 图片气泡
+  /// 图片气泡（支持传输状态叠加层）
   Widget _buildImageBubble(ChatMessage msg) {
+    final bool isTransferring = msg.transferState == TransferState.transferring;
+    final bool isFailed = msg.transferState == TransferState.failed;
+
     return ClipRRect(
       borderRadius: BorderRadius.circular(6),
       child: Container(
@@ -563,20 +830,122 @@ class _ChatPageState extends State<ChatPage> {
           maxHeight: 220,
         ),
         decoration: BoxDecoration(
-          border: Border.all(color: Colors.black12, width: 0.5),
+          border: Border.all(
+            color: isFailed ? Colors.red.shade200 : Colors.black12,
+            width: 0.5,
+          ),
           borderRadius: BorderRadius.circular(6),
         ),
-        child: Image.file(
-          File(msg.imagePath!),
-          fit: BoxFit.cover,
-          errorBuilder: (context, error, stackTrace) {
-            return Container(
-              height: 120,
-              width: 120,
-              color: Colors.grey[200],
-              child: const Icon(Icons.broken_image, color: Colors.grey),
-            );
-          },
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            Image.file(
+              File(msg.imagePath!),
+              fit: BoxFit.cover,
+              errorBuilder: (context, error, stackTrace) {
+                return Container(
+                  height: 120,
+                  width: 120,
+                  color: Colors.grey[200],
+                  child: const Icon(Icons.broken_image, color: Colors.grey),
+                );
+              },
+            ),
+            // 传输中遮罩
+            if (isTransferring)
+              Positioned.fill(
+                child: Container(
+                  color: Colors.black.withValues(alpha: 0.4),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const CupertinoActivityIndicator(radius: 14, color: Colors.white),
+                      const SizedBox(height: 8),
+                      Text(
+                        '${(msg.progress * 100).toStringAsFixed(0)}%',
+                        style: const TextStyle(color: Colors.white, fontSize: 13),
+                      ),
+                      // 取消按钮：发送端始终显示；接收端仅在非自动接收时显示
+                      if (msg.isMe || !_autoReceive) ...[
+                        const SizedBox(height: 6),
+                        GestureDetector(
+                          onTap: () => _cancelTransfer(msg),
+                          child: Container(
+                            width: 22,
+                            height: 22,
+                            decoration: BoxDecoration(
+                              color: Colors.redAccent.withValues(alpha: 0.3),
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(Icons.close, size: 14, color: Colors.white),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            // 失败遮罩
+            if (isFailed)
+              Positioned.fill(
+                child: Container(
+                  color: Colors.red.withValues(alpha: 0.15),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.error_outline, color: Colors.redAccent, size: 32),
+                      const SizedBox(height: 6),
+                      Text(
+                        msg.content,
+                        style: const TextStyle(color: Colors.redAccent, fontSize: 11),
+                        textAlign: TextAlign.center,
+                      ),
+                      // 发送端显示重试按钮
+                      if (msg.isMe) ...[
+                        const SizedBox(height: 6),
+                        GestureDetector(
+                          onTap: () {
+                            if (msg.filePath != null) {
+                              _sendFileFromPath(msg.filePath!, msg.fileName ?? 'image', isImage: true);
+                            }
+                          },
+                          child: Text(
+                            '发送失败，点击重试',
+                            style: TextStyle(fontSize: 11, color: Colors.red.shade400, decoration: TextDecoration.underline),
+                          ),
+                        ),
+                      ],
+                      // 接收端：点击请求对方重新发送（仅非自动接收时）
+                      if (!msg.isMe && !_autoReceive) ...[
+                        const SizedBox(height: 6),
+                        GestureDetector(
+                          onTap: () {
+                            widget.msgService.sendFileAccept(
+                              targetIp: widget.id,
+                              originalFileName: msg.fileName ?? '',
+                            );
+                            final index = chatData.indexWhere((m) => m.id == msg.id);
+                            if (index != -1) {
+                              setState(() {
+                                chatData[index] = msg.copyWith(
+                                  content: '📥 等待对方重新发送: ${msg.fileName ?? ''}',
+                                  transferState: TransferState.pending,
+                                );
+                              });
+                              _cacheService.updateMessage(widget.id, msg.id, chatData[index]);
+                            }
+                          },
+                          child: Text(
+                            '点击继续接收',
+                            style: TextStyle(fontSize: 11, color: Colors.blue.shade400, decoration: TextDecoration.underline),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+          ],
         ),
       ),
     );
@@ -656,7 +1025,7 @@ class _ChatPageState extends State<ChatPage> {
 
           // 消息内容文本
           if (msg.content.isNotEmpty && !isFile)
-            Text(
+            SelectableText(
               msg.content,
               style: const TextStyle(
                 fontSize: 16,
@@ -674,7 +1043,8 @@ class _ChatPageState extends State<ChatPage> {
               ),
             ),
 
-          // 进度条（传输中时显示）
+          // 进度条（传输中时显示）+ 取消按钮
+          // 取消按钮：发送端始终显示；接收端仅在非自动接收时显示
           if (isTransferring) ...[
             const SizedBox(height: 6),
             ClipRRect(
@@ -686,26 +1056,79 @@ class _ChatPageState extends State<ChatPage> {
                 valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF07C160)),
               ),
             ),
-            const SizedBox(height: 2),
-            Text(
-              '${(msg.progress * 100).toStringAsFixed(0)}%',
-              style: TextStyle(fontSize: 11, color: Colors.grey[500]),
+            const SizedBox(height: 4),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  '${(msg.progress * 100).toStringAsFixed(0)}%',
+                  style: TextStyle(fontSize: 11, color: Colors.grey[500]),
+                ),
+                if (msg.isMe || !_autoReceive) ...[
+                  const SizedBox(width: 8),
+                  GestureDetector(
+                    onTap: () => _cancelTransfer(msg),
+                    child: Container(
+                      width: 18,
+                      height: 18,
+                      decoration: BoxDecoration(
+                        color: Colors.redAccent.withValues(alpha: 0.15),
+                        shape: BoxShape.circle,
+                      ),
+                      child: const Icon(
+                        Icons.close,
+                        size: 12,
+                        color: Colors.redAccent,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
             ),
           ],
 
           // 失败重试按钮
-          if (isFailed) ...[
+          if (isFailed && msg.isMe) ...[
             const SizedBox(height: 6),
             GestureDetector(
               onTap: () {
                 // 重新发送
                 if (msg.filePath != null) {
-                  _sendFileFromPath(msg.filePath!, msg.fileName ?? 'file');
+                  _sendFileFromPath(msg.filePath!, msg.fileName ?? 'file',
+                      isImage: msg.type == MessageType.image);
                 }
               },
               child: Text(
                 '发送失败，点击重试',
                 style: TextStyle(fontSize: 12, color: Colors.red.shade400),
+              ),
+            ),
+          ],
+          // 接收端失败/已拒绝：点击请求对方重新发送（仅非自动接收时有效）
+          if (isFailed && !msg.isMe && !_autoReceive) ...[
+            const SizedBox(height: 6),
+            GestureDetector(
+              onTap: () {
+                // 发送 file_accept 请求对方重新发送
+                widget.msgService.sendFileAccept(
+                  targetIp: widget.id,
+                  originalFileName: msg.fileName ?? '',
+                );
+                // 更新本地消息为"等待对方重新发送"
+                final index = chatData.indexWhere((m) => m.id == msg.id);
+                if (index != -1) {
+                  setState(() {
+                    chatData[index] = msg.copyWith(
+                      content: '📥 等待对方重新发送: ${msg.fileName ?? ''}',
+                      transferState: TransferState.pending,
+                    );
+                  });
+                  _cacheService.updateMessage(widget.id, msg.id, chatData[index]);
+                }
+              },
+              child: Text(
+                '点击继续接收',
+                style: TextStyle(fontSize: 12, color: Colors.blue.shade400, decoration: TextDecoration.underline),
               ),
             ),
           ],
@@ -895,6 +1318,8 @@ class _ChatPageState extends State<ChatPage> {
 
   @override
   void dispose() {
+    _focusNode.removeListener(_onFocusChanged);
+    _msgSubscription?.cancel();
     _progressSubscription?.cancel();
     _newTaskSubscription?.cancel();
     _transferService.dispose();
@@ -902,5 +1327,49 @@ class _ChatPageState extends State<ChatPage> {
     _focusNode.dispose();
     _scrollController.dispose();
     super.dispose();
+  }
+
+  /// 构建精选常用 emoji 列表，跳过 Unicode 未分配的空白区间
+  static List<String> _buildEmojiList() {
+    // 表情/笑脸 (U+1F600–U+1F64F)
+    final smileys = List.generate(80, (i) => String.fromCharCode(0x1F600 + i));
+    // 杂项符号与象形文字 (U+1F300–U+1F5FF 中的 emoji 部分)
+    final misc = List.generate(768, (i) => String.fromCharCode(0x1F300 + i));
+    // 交通与地图 (U+1F680–U+1F6FF)
+    final transport = List.generate(128, (i) => String.fromCharCode(0x1F680 + i));
+    // 补充符号 (U+1F900–U+1F9FF)
+    final supplement = List.generate(256, (i) => String.fromCharCode(0x1F900 + i));
+    // 常用手势/人物 (U+270A–U+27BF 和 U+1F440–U+1F450)
+    final gestures = <String>[
+      '\u{1F44D}', '\u{1F44E}', '\u{1F44F}', '\u{1F44A}',
+      '\u{270A}', '\u{270B}', '\u{270C}', '\u{1F44C}',
+      '\u{1F450}', '\u{1F932}',
+    ];
+
+    final all = <String>[
+      ...smileys,
+      ...misc,
+      ...transport,
+      ...supplement,
+      ...gestures,
+    ];
+
+    // 过滤掉已知不可渲染的字符（某些码点没有字形）
+    final valid = <String>[];
+    for (final ch in all) {
+      final cp = ch.runes.first;
+      // 跳过未分配的 Unicode 区域
+      if (cp >= 0x1F4D0 && cp <= 0x1F4FF) continue; // 部分未分配
+      if (cp >= 0x1F550 && cp <= 0x1F5FF) continue; // 部分未分配
+      if (cp >= 0x1F650 && cp <= 0x1F67F) continue; // 装饰性符号（很多平台不显示）
+      if (cp >= 0x1F6D5 && cp <= 0x1F6FF) continue; // 部分未分配
+      if (cp >= 0x1F780 && cp <= 0x1F7FF) continue; // 几何形状扩展
+      if (cp >= 0x1F800 && cp <= 0x1F8FF) continue; // 补充箭头-C
+      if (cp >= 0x1FA00 && cp <= 0x1FA6F) continue; // 国际象棋
+      if (cp >= 0x1FA70 && cp <= 0x1FAFF) continue; // 扩展-A 中的非 emoji
+      valid.add(ch);
+    }
+
+    return valid;
   }
 }
