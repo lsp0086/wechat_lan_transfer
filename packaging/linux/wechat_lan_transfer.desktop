@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=局域网快传
+Comment=局域网文件/文字传输（U2：文件管理器右键"打开方式"发送）
+Exec=wechat_lan_transfer --send %F
+Icon=wechat_lan_transfer
+Terminal=false
+Type=Application
+Categories=Utility;Network;FileTransfer;
+MimeType=application/octet-stream;
+StartupWMClass=wechat_lan_transfer

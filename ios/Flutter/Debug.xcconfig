@@ -1,0 +1,2 @@
+#include? "Pods/Target Support Files/Pods-wechat_lan_transfer/Pods-wechat_lan_transfer.debug.xcconfig"
+#include "Generated.xcconfig"

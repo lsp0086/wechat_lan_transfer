@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=局域网传输
+Name[en]=LAN Transfer
+Comment=局域网文件与文字互传
+Comment[en]=LAN file & text transfer
+Exec=wechat_lan_transfer
+Icon=wechat_lan_transfer
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+StartupWMClass=wechat_lan_transfer

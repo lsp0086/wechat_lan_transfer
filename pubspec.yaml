@@ -1,0 +1,95 @@
+name: wechat_lan_transfer
+description: "A new Flutter project."
+# The following line prevents the package from being accidentally published to
+# pub.dev using `flutter pub publish`. This is preferred for private packages.
+publish_to: 'none' # Remove this line if you wish to publish to pub.dev
+
+# The following defines the version and build number for your application.
+# A version number is three numbers separated by dots, like 1.2.43
+# followed by an optional build number separated by a +.
+# Both the version and the builder number may be overridden in flutter
+# build by specifying --build-name and --build-number, respectively.
+# In Android, build-name is used as versionName while build-number used as versionCode.
+# Read more about Android versioning at https://developer.android.com/studio/publish/versioning
+# In iOS, build-name is used as CFBundleShortVersionString while build-number is used as CFBundleVersion.
+# Read more about iOS versioning at
+# https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
+# In Windows, build-name is used as the major, minor, and patch parts
+# of the product and file versions while build-number is used as the build suffix.
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.10.7
+
+# Dependencies specify other packages that your package needs in order to work.
+# To automatically upgrade your package dependencies to the latest versions
+# consider running `flutter pub upgrade --major-versions`. Alternatively,
+# dependencies can be manually updated by changing the version numbers below to
+# the latest version available on pub.dev. To see which dependencies have newer
+# versions available, run `flutter pub outdated`.
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # E3 依赖审计（2026-09-30）：以下依赖均在 lib/ 下有直接引用，无未用依赖，暂不删减。
+  # file_picker/chat_list 文件选择 · multicast_dns/mdns_discovery 发现桩 ·
+  # network_info_plus+device_info_plus/chat_list 设备/IP · path_provider/多服务 缓存目录 ·
+  # image_picker+flutter_image_compress/chat_page 图片/缩略图 · record+audioplayers/audio_service+chat_page 语音 ·
+  # archive/chat_page zip 打包解压 · crypto/protocol_codec+file_transfer+tls_identity 哈希/HMAC/指纹 ·
+  # basic_utils/tls_identity 自签证书 · permission_handler/chat_page 存储权限 · share_plus/chat_page 文件分享
+  file_picker: ^8.0.0
+  multicast_dns: ^0.3.2+4
+  cupertino_icons: ^1.0.8
+  flutter_localizations:
+    sdk: flutter
+  network_info_plus: ^6.0.0 # 用于获取当前手机的局域网 IP
+  device_info_plus: ^11.0.0
+  path_provider: ^2.1.0 # 用于获取应用文档目录（消息缓存）
+  image_picker: ^1.0.0 # 用于拍照和选择图片
+  flutter_image_compress: ^2.3.0 # 用于生成图片缩略图
+  record: ^6.2.0 # 跨平台音频录制
+  audioplayers: ^6.7.0 # 跨平台音频播放
+  archive: ^4.0.2 # 用于文件夹打包为 zip
+  crypto: ^3.0.7 # 文件 SHA-256 完整性校验（P0-3，LocalSend FileDto.sha256 对标）
+  basic_utils: ^5.8.2 # 自签证书生成（P0-1，TCP 传输 TLS 加密）
+  permission_handler: ^11.3.0 # 运行时权限请求（MANAGE_EXTERNAL_STORAGE 等）
+  share_plus: ^10.0.0 # 移动端分享/发送到（"文件位置"功能用）
+  flutter_secure_storage: ^9.2.4 # S4：私钥/机身身份迁入 Keychain/Keystore/DPAPI
+  sqlite3: ^2.4.0 # E3：消息缓存迁 sqlite（真增量写 + 大历史分页，对标 LocalSend）
+  sqlite3_flutter_libs: ^0.5.24 # E3：Android/iOS 打包自带 sqlite3 原生库
+  ffi: ^2.1.0 # T4：Android statvfs FFI（malloc/calloc 原生内存分配）
+  receive_sharing_intent: 1.8.1 # U2：从其他 App 分享进来（Android SEND intent，iOS 待扩展）；钉版：1.9+ 仅 SPM 与本项目 CocoaPods 不兼容
+  desktop_drop: ^0.5.0 # U2：桌面端拖拽文件到设备列表发送
+  uuid: ^4.6.0
+  path: ^1.9.1
+  synchronized: ^3.4.0
+  mime: ^2.1.0
+  collection: ^1.19.1
+  logging: ^1.3.0
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.3
+
+# 应用图标生成配置（dart run flutter_launcher_icons）
+flutter_launcher_icons:
+  image_path: "assets/icon/icon.png"
+  ios: true
+  remove_alpha_ios: true
+  android: true
+  min_sdk_android: 21
+  adaptive_icon_background: "#048A43"
+  adaptive_icon_foreground: "assets/icon/icon.png"
+  adaptive_icon_foreground_padding: 36
+  macos:
+    generate: true
+  windows:
+    generate: true
+    icon_size: 256
+  linux:
+    generate: true
+
+# 💡 核心修复：在这里单独建立一栏顶格的 flutter 配置
+flutter:
+  uses-material-design: true

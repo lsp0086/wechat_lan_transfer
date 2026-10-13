@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <!-- U2/iOS：App Group（与主 App（wechat_lan_transfer）一致，经 CUSTOM_GROUP_ID 注入） -->
+    <key>AppGroupId</key>
+    <string>$(CUSTOM_GROUP_ID)</string>
+    <key>CFBundleVersion</key>
+    <string>$(FLUTTER_BUILD_NUMBER)</string>
+    <key>NSExtension</key>
+    <dict>
+      <key>NSExtensionAttributes</key>
+      <dict>
+        <key>PHSupportedMediaTypes</key>
+        <array>
+          <string>Video</string>
+          <string>Image</string>
+        </array>
+        <key>NSExtensionActivationRule</key>
+        <dict>
+          <!-- 文字 / URL / 图片 / 视频均支持；文件走 SupportsWithSubtypes -->
+          <key>NSExtensionActivationSupportsText</key>
+          <true/>
+          <key>NSExtensionActivationSupportsWebURLWithMaxCount</key>
+          <integer>1</integer>
+          <key>NSExtensionActivationSupportsWebPageWithMaxCount</key>
+          <integer>1</integer>
+          <key>NSExtensionActivationSupportsImageWithMaxCount</key>
+          <integer>30</integer>
+          <key>NSExtensionActivationSupportsMovieWithMaxCount</key>
+          <integer>10</integer>
+          <key>NSExtensionActivationSupportsFileWithMaxCount</key>
+          <integer>30</integer>
+        </dict>
+      </dict>
+      <key>NSExtensionMainStoryboard</key>
+      <string>MainInterface</string>
+      <key>NSExtensionPointIdentifier</key>
+      <string>com.apple.share-services</string>
+    </dict>
+  </dict>
+</plist>

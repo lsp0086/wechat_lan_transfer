@@ -1,0 +1,16 @@
+Windows Registry Editor Version 5.00
+; U2：右键"发送到 → 局域网快传"（安装器一次性提权运行一次即可）
+; 目标 exe 路径按实际安装位置修改后再双击导入
+; 之后右键任意文件 → 发送到 → 局域网快传，即可以启动参数打开应用并选设备发送
+
+[HKEY_CURRENT_USER\Software\Classes\*\shell\WeChatLanTransfer]
+@="发送到局域网快传"
+
+[HKEY_CURRENT_USER\Software\Classes\*\shell\WeChatLanTransfer\command]
+@="\"C:\\Program Files\\WeChatLanTransfer\\wechat_lan_transfer.exe\" --send \"%1\""
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\WeChatLanTransfer]
+@="发送文件夹到局域网快传"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\WeChatLanTransfer\command]
+@="\"C:\\Program Files\\WeChatLanTransfer\\wechat_lan_transfer.exe\" --send \"%1\""

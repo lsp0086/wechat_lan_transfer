@@ -1,0 +1,2 @@
+#include? "Pods/Target Support Files/Pods-wechat_lan_transfer/Pods-wechat_lan_transfer.release.xcconfig"
+#include "ephemeral/Flutter-Generated.xcconfig"
