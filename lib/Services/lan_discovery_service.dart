@@ -40,11 +40,19 @@ class LanDiscoveryService {
     _udpSocket = await _bindWithProbe(preferredPort);
     _udpPort = _udpSocket!.port;
     _udpSocket?.broadcastEnabled = true;
-    try {
-      _udpSocket?.joinMulticast(InternetAddress('224.0.0.1'));
-      debugPrint('[Discovery] 强行加入组播组 224.0.0.1 成功');
-    } catch (e) {
-      debugPrint('[Discovery] 加入组播组失败（非关键阻碍，继续执行）: $e');
+    // iOS 无组播 entitlement：joinMulticast 会"成功"把 socket 标记为组播
+    // socket，导致该 socket 的全部入站 UDP（含单播/广播）被系统静默拦截
+    // （实测 8888 全灭而未 join 的 53317 正常）。组播发现在 iOS 本就不可用
+    // （发送报 errno 65），join 只有风险没有收益，直接跳过。
+    if (Platform.isIOS) {
+      debugPrint('[Discovery] iOS 跳过加入组播组（避免入站 UDP 被系统拦截）');
+    } else {
+      try {
+        _udpSocket?.joinMulticast(InternetAddress('224.0.0.1'));
+        debugPrint('[Discovery] 强行加入组播组 224.0.0.1 成功');
+      } catch (e) {
+        debugPrint('[Discovery] 加入组播组失败（非关键阻碍，继续执行）: $e');
+      }
     }
     _udpSocketV6 = await _bindV6(_udpPort, localIPs);
     _listen(_udpSocket!, onDatagram);
@@ -129,11 +137,16 @@ class LanDiscoveryService {
         port,
         reuseAddress: true,
       );
-      try {
-        socket.joinMulticast(InternetAddress('ff02::1'));
-        debugPrint('[Discovery] N2 已加入 IPv6 组播 ff02::1');
-      } catch (e) {
-        debugPrint('[Discovery] N2 加入 IPv6 组播失败（继续单播/广播）: $e');
+      // 同 v4：iOS 无组播 entitlement，join 会把 socket 入站整体拦掉
+      if (Platform.isIOS) {
+        debugPrint('[Discovery] iOS 跳过加入 IPv6 组播 ff02::1');
+      } else {
+        try {
+          socket.joinMulticast(InternetAddress('ff02::1'));
+          debugPrint('[Discovery] N2 已加入 IPv6 组播 ff02::1');
+        } catch (e) {
+          debugPrint('[Discovery] N2 加入 IPv6 组播失败（继续单播/广播）: $e');
+        }
       }
       debugPrint('[Discovery] N2 IPv6 socket 绑定成功: $port');
       return socket;

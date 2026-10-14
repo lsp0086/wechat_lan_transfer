@@ -206,9 +206,10 @@ Future<InterfaceScanResult> enumerateInterfaces() async {
           throw UnsupportedError('InterfaceAddress API 不可用');
         }
       } catch (e) {
-        debugPrint('获取 $addressStr 广播地址失败（可能旧 Dart 版本）: $e');
-        // 回退到 /24 假设（向下兼容）
+        // Darwin 平台 InterfaceAddress.broadcast 不可用属预期，/24 回退即生效
         final fallback = LanUtils.legacySubnetBroadcast(addressStr);
+        debugPrint(
+            '获取 $addressStr 广播地址失败，已回退 /24 -> $fallback: $e');
         if (fallback != null &&
             !result.subnetBroadcasts.any((a) => a.address == fallback)) {
           result.subnetBroadcasts.add(InternetAddress(fallback));

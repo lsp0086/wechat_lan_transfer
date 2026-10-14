@@ -968,14 +968,23 @@ class ChatListPageState extends State<ChatListPage>
   /// v2：组播发现事件 → 设备注册表（按指纹合并；deviceId 即指纹，
   /// 与 legacy 广播发现天然合并到同一设备条目）。
   void _onLsDeviceDiscovered(LsDiscoveredDevice d) {
+    debugPrint(
+        '[ChatList] LS发现事件: ${d.alias}(${d.ip}:${d.port}) '
+        'fp=${d.fingerprint.length > 8 ? d.fingerprint.substring(0, 8) : d.fingerprint}');
     // 自端回环过滤（发现服务已过滤，此处双保险）
-    if (_localIPList.contains(d.ip)) return;
-    if (_handshake.blocked.contains(d.fingerprint)) return; // 已拉黑忽略
+    if (_localIPList.contains(d.ip)) {
+      debugPrint('[ChatList] LS发现忽略(本端IP): ${d.ip}');
+      return;
+    }
+    if (_handshake.blocked.contains(d.fingerprint)) {
+      debugPrint('[ChatList] LS发现忽略(已拉黑): ${d.fingerprint}');
+      return; // 已拉黑忽略
+    }
     _msgService.recordHeartbeat(d.fingerprint);
     // 已有条目保留其 legacy UDP 端口（单播心跳通道），仅新建时用默认端口兜底
     final existing =
         _allDevices.firstWhereOrNull((dev) => dev.id == d.fingerprint);
-    _upsertDevice(
+    final isNew = _upsertDevice(
       deviceKey: d.fingerprint,
       peerIp: d.ip,
       name: d.alias,
@@ -986,6 +995,7 @@ class ChatListPageState extends State<ChatListPage>
       // E1：mDNS 默认文案抽至 device_lookup.mdnsOnlineText。
       lastMsg: mdnsOnlineText(),
     );
+    debugPrint('[ChatList] LS设备入库: ${d.alias}(${d.ip}) 新建=$isNew 心跳已刷新');
   }
 
   /// ChatPage 用户点击手动接收文件的回调（v2：完成对应会话的挂起决策）。
@@ -1161,6 +1171,7 @@ class ChatListPageState extends State<ChatListPage>
       // 需在 _lsServer.start 之后：announce 携带的端口取 _lsServer.boundPort。
       LsDiscovery.instance.extraBroadcastTargets =
           List.of(_subnetBroadcastAddresses);
+      LsDiscovery.instance.localV4Ips = List.of(_localIPList);
       LsDiscovery.instance.selfInfo = _buildLsSelfInfo;
       _lsDiscoverySub?.cancel();
       _lsDiscoverySub =
@@ -1406,6 +1417,7 @@ class ChatListPageState extends State<ChatListPage>
 
   // 设备离线处理（E1：集合变更抽至 peer_presence，在线集合变化自动落盘）。
   void _onDeviceOffline(String deviceId) {
+    debugPrint('[ChatList] 设备离线: $deviceId');
     if (!mounted) return;
     setState(() {
       _presence.markOffline(deviceId);

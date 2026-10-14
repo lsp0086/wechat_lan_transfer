@@ -101,6 +101,10 @@ class LsDiscovery {
   static const Duration announceInterval = Duration(seconds: 3);
 
   RawDatagramSocket? _socket;
+  /// 独立发送 socket：RawDatagramSocket 的异步发送错误会终止其读事件流
+  /// （实测 errno 49/65 后 socket 从此收不到任何数据报，release 端整个
+  /// 发现失联），监听 socket 必须只收不发，announce 全部走它。
+  RawDatagramSocket? _sendSocket;
   Timer? _announceTimer;
   bool _running = false;
   int _boundPort = kLsDefaultPort;
@@ -122,12 +126,24 @@ class LsDiscovery {
   /// 超过 [registerRetryInterval] 再重发（对端可能后启动错过首次）。
   final Map<String, DateTime> _registerAttempted = {};
 
-  /// register 重发间隔。
-  static const Duration registerRetryInterval = Duration(seconds: 20);
+  /// register 重发间隔。必须 < 心跳超时（UdpMsgService.heartbeatTimeout
+  /// 10s）：某端 UDP 入站被系统拦截时（如 macOS 本地网络 TCC 静默丢弃
+  /// 跨设备入站单播，实测 debug 版必现），对端只能靠本端周期 register
+  /// 刷新在线状态，间隔过长会导致设备在列表上闪烁离线。
+  static const Duration registerRetryInterval = Duration(seconds: 8);
 
   /// 已知对端（announce/register 学习到的 ip -> 对端发现 socket UDP 端口）。
   /// 周期 announce 时额外向这些对端补发单播，绕开 iOS 组播/广播限制保活。
   final Map<String, int> _knownPeers = {};
+
+  /// 子网扫描（官方 scan_subnet 对等）：正在扫描的接口 IP（防重入）。
+  final Set<String> _scanningIfaces = {};
+
+  /// 自动扫描定时器：扫到设备或 stop() 时停止。
+  Timer? _scanTimer;
+
+  /// 本端 v4 IP 列表（调用方启动前注入，子网扫描用）。
+  List<String> localV4Ips = const [];
 
   /// 启动（幂等）。绑定 UDP 53317（占用则向下兼容探测 +1..+10），
   /// 加入组播组并开始周期 announce。
@@ -168,10 +184,16 @@ class LsDiscovery {
     // 发送 255.255.255.255 / 子网广播地址必须显式开 SO_BROADCAST，
     // 否则 send 异步报 EACCES（errno 13），announce 广播全灭（组播不受影响）
     sock.broadcastEnabled = true;
-    try {
-      socket.joinMulticast(InternetAddress(kLsMulticastAddr));
-    } catch (e) {
-      debugPrint('[LsDiscovery] 加入组播组失败（仅广播发现可用）: $e');
+    // iOS 无组播 entitlement：join 成功反而会把 socket 入站整体拦掉
+    // （同 8888 教训），join 失败反而幸存；统一 iOS 跳过最稳
+    if (Platform.isIOS) {
+      debugPrint('[LsDiscovery] iOS 跳过加入组播组 $kLsMulticastAddr');
+    } else {
+      try {
+        socket.joinMulticast(InternetAddress(kLsMulticastAddr));
+      } catch (e) {
+        debugPrint('[LsDiscovery] 加入组播组失败（仅广播发现可用）: $e');
+      }
     }
     socket.listen((event) {
       if (event == RawSocketEvent.read) {
@@ -182,12 +204,136 @@ class LsDiscovery {
       debugPrint('[LsDiscovery] 监听异常: $e');
     });
 
+    // 独立发送 socket（临时端口 + SO_BROADCAST），发送错误只打日志不毒化监听
+    try {
+      final sender = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+      // 发送 255.255.255.255 / 子网广播地址必须显式开 SO_BROADCAST，
+      // 否则 send 异步报 EACCES（errno 13）（组播不受影响）
+      sender.broadcastEnabled = true;
+      sender.listen((_) {}, onError: (Object e) {
+        debugPrint('[LsDiscovery] 发送 socket 异常（忽略）: $e');
+      });
+      _sendSocket = sender;
+    } catch (e) {
+      debugPrint('[LsDiscovery] 发送 socket 创建失败（退化为监听 socket 发送）: $e');
+    }
+
     // 启动突发：100/500/2000ms（对齐官方 ANNOUNCE_DELAYS）+ 周期 3s
     _announceAt(const Duration(milliseconds: 100));
     _announceAt(const Duration(milliseconds: 500));
     _announceAt(const Duration(milliseconds: 2000));
     _announceTimer = Timer.periodic(announceInterval, (_) => _announce());
     debugPrint('[LsDiscovery] v2 组播发现已启动: UDP 端口 $_boundPort');
+    // 自动子网扫描：5s 后首扫（announce 突发已发完），空手而归则每 30s
+    // 重扫直到发现设备。官方 scan_subnet 语义：组播不可用网络上的兜底
+    _scanTimer = Timer(const Duration(seconds: 5), _autoScan);
+  }
+
+  /// 自动扫描：发现过设备（_knownPeers 非空）就不再扫，否则 30s 重试。
+  Future<void> _autoScan() async {
+    if (!_running) return;
+    final found = await scanSubnet();
+    if (found || !_running) return;
+    _scanTimer = Timer(const Duration(seconds: 30), _autoScan);
+  }
+
+  /// 子网 HTTP 扫描（对齐官方 discovery scan_subnet）：对本端 v4 接口的
+  /// /24 网段逐个 POST /register 探测（并发 50、单请求 700ms 兜底超时）。
+  /// 无组播 entitlement/announce 被拦的网络上的兜底发现——HTTPS 走 TCP，
+  /// 不受任何 UDP 拦截影响，对端 HTTPS 服务可达即被发现。
+  /// 返回本次是否扫到至少一台对端。
+  Future<bool> scanSubnet({String? interfaceIp}) async {
+    final self = selfInfo?.call();
+    if (!_running || self == null) return false;
+    final v4s = localV4Ips
+        .where((ip) => !ip.contains(':') && ip != '127.0.0.1')
+        .toList();
+    final localIp = interfaceIp ?? (v4s.isEmpty ? '' : v4s.first);
+    if (localIp.isEmpty) return false;
+    if (!_scanningIfaces.add(localIp)) return false;
+    try {
+      final octets = localIp.split('.');
+      if (octets.length != 4) return false;
+      final prefix = '${octets[0]}.${octets[1]}.${octets[2]}.';
+      final selfFp = TlsIdentityService.instance.fingerprint.toLowerCase();
+      final declaredFp = self.fingerprint.trim().toLowerCase();
+      final targets = <String>[];
+      for (var h = 1; h < 255; h++) {
+        final ip = '$prefix$h';
+        if (ip == localIp) continue;
+        targets.add(ip);
+      }
+      debugPrint('[LsDiscovery] 子网扫描开始: ${prefix}0/24 (${targets.length} 个目标)');
+      var found = 0;
+      // 分批并发（官方 SCAN_CONCURRENCY=50）；跳过 .0/.255 减少无效超时
+      for (var i = 0; i < targets.length; i += 50) {
+        final batch = targets.skip(i).take(50);
+        await Future.wait(batch.map((ip) async {
+          final device = await _probe(ip, self.port, selfFp, declaredFp);
+          if (device != null) {
+            found++;
+            _knownPeers.putIfAbsent(ip, () => kLsDefaultPort);
+            _events.add(device);
+          }
+        }));
+      }
+      debugPrint('[LsDiscovery] 子网扫描完成: 发现 $found 台设备');
+      return found > 0;
+    } finally {
+      _scanningIfaces.remove(localIp);
+    }
+  }
+
+  /// 向 host:port 发 register 探测。对端自签证书一律接受（TOFU，传输期
+  /// 钉扎+PIN 保证安全），指纹取响应体（与 announce 同语义）。
+  /// 不可达/超时/自端返回 null。
+  Future<LsDiscoveredDevice?> _probe(
+    String ip,
+    int port,
+    String selfFp,
+    String declaredFp,
+  ) async {
+    final self = selfInfo?.call();
+    if (self == null) return null;
+    HttpClient? client;
+    try {
+      client = HttpClient(context: SecurityContext())
+        ..connectionTimeout = const Duration(milliseconds: 500)
+        ..badCertificateCallback = (cert, host, port) => true;
+      final req = await client
+          .postUrl(Uri.parse(
+              'https://$ip:$port/api/localsend/v2/register'))
+          .timeout(const Duration(milliseconds: 700));
+      req.headers.contentType = ContentType.json;
+      req.write(jsonEncode(self.toJson()));
+      final res = await req.close().timeout(const Duration(milliseconds: 700));
+      final body = await utf8.decoder.bind(res).join();
+      final json = jsonDecode(body);
+      if (json is! Map<String, dynamic>) return null;
+      final fp = '${json['fingerprint'] ?? ''}'.trim().toLowerCase();
+      if (fp.isEmpty || fp == selfFp || (declaredFp.isNotEmpty && fp == declaredFp)) {
+        return null;
+      }
+      final alias = '${json['alias'] ?? ''}'.trim();
+      debugPrint('[LsDiscovery] 子网扫描发现: ${alias.isEmpty ? '未知设备' : alias}($ip:$port) fp=$fp');
+      return LsDiscoveredDevice(
+        fingerprint: fp,
+        alias: alias.isEmpty ? '未知设备' : alias,
+        ip: ip,
+        port: port,
+        version: '${json['version'] ?? ''}',
+        deviceModel: json['deviceModel'] as String?,
+        deviceType: json['deviceType'] as String?,
+        download: json['download'] == true,
+        lastSeen: DateTime.now(),
+      );
+    } catch (_) {
+      return null;
+    } finally {
+      try {
+        client?.close(force: true);
+      } catch (_) {}
+    }
   }
 
   void _announceAt(Duration delay) {
@@ -197,7 +343,7 @@ class LsDiscovery {
   }
 
   void _announce() {
-    final socket = _socket;
+    final socket = _sendSocket ?? _socket;
     final self = selfInfo?.call();
     if (socket == null || self == null) return;
     final bytes = utf8.encode(jsonEncode(lsBuildAnnounce(self)));
@@ -221,6 +367,10 @@ class LsDiscovery {
         socket.send(bytes, InternetAddress(entry.key), entry.value);
       } catch (_) {}
     }
+    debugPrint(
+        '[LsDiscovery] announce 周期: 广播目标 ${targets.length} 个, '
+        '单播保活 ${_knownPeers.length} 个 '
+        '(${_knownPeers.entries.map((e) => '${e.key}:${e.value}').join(', ')})');
   }
 
   void _handleDatagram(Datagram dg) {
@@ -233,13 +383,22 @@ class LsDiscovery {
       // 组播回环：忽略本端
       final selfFp = TlsIdentityService.instance.fingerprint.toLowerCase();
       final declaredFp = selfInfo?.call().fingerprint.toLowerCase() ?? '';
-      if (device.fingerprint == selfFp ||
-          (declaredFp.isNotEmpty && device.fingerprint == declaredFp)) {
-        return;
-      }
-      // 记录对端发现 socket 源端口（数据报源端口即对端绑定的接收端口），
-      // 供周期单播 announce 保活
-      _knownPeers[device.ip] = dg.port;
+      final isSelf = device.fingerprint == selfFp ||
+          (declaredFp.isNotEmpty && device.fingerprint == declaredFp);
+      debugPrint(
+          '[LsDiscovery] 收到 announce: ${device.alias}(${device.ip}:${dg.port}) '
+          'fp=${device.fingerprint.length > 8 ? device.fingerprint.substring(0, 8) : device.fingerprint}'
+          '${isSelf ? ' [自端回环，忽略]' : ''}');
+      if (isSelf) return;
+      // 记录对端发现 socket 接收端口，供周期单播 announce 保活。
+      // 数据报源端口在 [53317, 53327) 内视为对端监听端口（旧版单 socket
+      // 发收同端口）；新版发送走临时端口，源端口不在范围内则取默认端口
+      // （对端监听 socket 优先绑定 53317，仅被占用时下移）
+      final srcPort = dg.port;
+      _knownPeers[device.ip] =
+          (srcPort >= kLsDefaultPort && srcPort < kLsDefaultPort + 10)
+              ? srcPort
+              : kLsDefaultPort;
       _events.add(device);
       // 新指纹：后台 register（对端由此得知本端，官方 probe 语义）。
       // 按 TTL 周期重发：对端可能后启动/重启（如 iOS 错过首次 register
@@ -301,7 +460,10 @@ class LsDiscovery {
     final selfFp = TlsIdentityService.instance.fingerprint.toLowerCase();
     final declaredFp = selfInfo?.call().fingerprint.toLowerCase() ?? '';
     final fp = peer.fingerprint.trim().toLowerCase();
-    if (fp == selfFp || (declaredFp.isNotEmpty && fp == declaredFp)) return;
+    if (fp == selfFp || (declaredFp.isNotEmpty && fp == declaredFp)) {
+      debugPrint('[LsDiscovery] register 自端回环忽略: $ip');
+      return;
+    }
     _knownPeers.putIfAbsent(ip, () => kLsDefaultPort);
     _events.add(LsDiscoveredDevice(
       fingerprint: fp,
@@ -321,10 +483,17 @@ class LsDiscovery {
     _running = false;
     _announceTimer?.cancel();
     _announceTimer = null;
+    _scanTimer?.cancel();
+    _scanTimer = null;
+    _scanningIfaces.clear();
     try {
       _socket?.close();
     } catch (_) {}
     _socket = null;
+    try {
+      _sendSocket?.close();
+    } catch (_) {}
+    _sendSocket = null;
     _registerAttempted.clear();
     _knownPeers.clear();
     if (Platform.isAndroid) {
